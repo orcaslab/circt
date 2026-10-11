@@ -81,7 +81,16 @@ private:
   Value createThreadState(ImplicitLocOpBuilder &b, StringRef stateName,
                           Type type, Value &memory);
   void writeThreadState(ImplicitLocOpBuilder &b, Value memory, Value clock,
-                        Value data);
+                        Value data, Value enable = {});
+  /// How a register is written: never (it only holds its value), or with
+  /// `data` when `enable` (always, if null).
+  struct Write {
+    bool holds;
+    Value enable, data;
+  };
+  /// The write of a register whose next value is `next`: the branches of its
+  /// muxes that hold the register are the cycles it is not written.
+  Write peelHolds(ImplicitLocOpBuilder &b, Value next, Value reg);
 
   hw::HWModuleOp model;
   unsigned threads;
@@ -419,12 +428,50 @@ Value Threader::createThreadState(ImplicitLocOpBuilder &b, StringRef stateName,
 }
 
 void Threader::writeThreadState(ImplicitLocOpBuilder &b, Value memory,
-                                Value clock, Value data) {
+                                Value clock, Value data, Value enable) {
   auto width = cast<seq::FirMemType>(memory.getType()).getWidth();
   data = b.createOrFold<hw::BitcastOp>(b.getIntegerType(width), data);
-  seq::FirMemWriteOp::create(b, memory, threadIdx, clock,
-                             hw::ConstantOp::create(b, b.getI1Type(), 1), data,
+  if (!enable)
+    enable = hw::ConstantOp::create(b, b.getI1Type(), 1);
+  seq::FirMemWriteOp::create(b, memory, threadIdx, clock, enable, data,
                              Value{});
+}
+
+Threader::Write Threader::peelHolds(ImplicitLocOpBuilder &b, Value next,
+                                    Value reg) {
+  if (next == reg)
+    return {/*holds=*/true, {}, {}};
+  auto mux = next.getDefiningOp<comb::MuxOp>();
+  if (!mux)
+    return {false, {}, next};
+  auto onTrue = peelHolds(b, mux.getTrueValue(), reg);
+  auto onFalse = peelHolds(b, mux.getFalseValue(), reg);
+  if (onTrue.holds && onFalse.holds)
+    return {true, {}, {}};
+  auto one = [&]() { return hw::ConstantOp::create(b, b.getI1Type(), 1); };
+  auto cond = mux.getCond();
+  if (onTrue.holds)
+    return {false,
+            onFalse.enable
+                ? b.createOrFold<comb::AndOp>(
+                      b.createOrFold<comb::XorOp>(cond, one()), onFalse.enable)
+                : b.createOrFold<comb::XorOp>(cond, one()),
+            onFalse.data};
+  if (onFalse.holds)
+    return {false,
+            onTrue.enable ? b.createOrFold<comb::AndOp>(cond, onTrue.enable)
+                          : cond,
+            onTrue.data};
+  Value enable;
+  if (onTrue.enable || onFalse.enable)
+    enable =
+        b.createOrFold<comb::MuxOp>(cond, onTrue.enable ? onTrue.enable : one(),
+                                    onFalse.enable ? onFalse.enable : one());
+  Value data =
+      onTrue.data == mux.getTrueValue() && onFalse.data == mux.getFalseValue()
+          ? next
+          : b.createOrFold<comb::MuxOp>(cond, onTrue.data, onFalse.data);
+  return {false, enable, data};
 }
 
 LogicalResult Threader::run() {
@@ -533,16 +580,20 @@ LogicalResult Threader::run() {
       channel.next = getNext(channel.current, b);
   }
 
-  // Each register keeps one value per thread.
+  // Each register keeps one value per thread. The branches of its next value
+  // that hold it become the write enable of its memory rather than logic that
+  // writes it back.
   for (auto reg : registers) {
     Value next = reg.getNext();
     if (reg.getReset())
       next = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(), next);
+    auto write = peelHolds(b, next, reg.getResult());
     Value memory;
     auto value = createThreadState(b, reg.getName(), reg.getType(), memory);
     reg.getResult().replaceAllUsesWith(value);
     replaced[reg.getResult()] = value;
-    writeThreadState(b, memory, targetClock, next);
+    if (!write.holds)
+      writeThreadState(b, memory, targetClock, write.data, write.enable);
     reg.erase();
   }
 
