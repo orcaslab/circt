@@ -254,6 +254,72 @@ static std::string sanitize(StringRef name) {
   return result;
 }
 
+/// `sources`, most significant bit first, as a Verilog concatenation of the
+/// named ports' bits and constants.
+static std::string describe(const BitSources &sources,
+                            function_ref<std::string(Value)> nameOf) {
+  SmallVector<std::string> parts;
+  for (unsigned hi = sources.size(); hi > 0;) {
+    auto &top = sources[hi - 1];
+    unsigned lo = hi - 1;
+    // A run of bits of one port, in order, or of constants.
+    while (lo > 0) {
+      auto &next = sources[lo - 1];
+      bool same = top.kind == BitSource::Constant
+                      ? next.kind == BitSource::Constant
+                      : next.kind == BitSource::Port && next.port == top.port &&
+                            next.bit + (hi - lo) == top.bit;
+      if (!same)
+        break;
+      --lo;
+    }
+    if (top.kind == BitSource::Constant) {
+      std::string bits;
+      for (unsigned bit = hi; bit > lo; --bit)
+        bits += sources[bit - 1].value ? '1' : '0';
+      parts.push_back(std::to_string(hi - lo) + "'b" + bits);
+    } else {
+      auto width = hw::getBitWidth(top.port.getType());
+      unsigned low = top.bit - (hi - 1 - lo);
+      auto name = nameOf(top.port);
+      if (low == 0 && top.bit + 1 == unsigned(width))
+        parts.push_back(name);
+      else if (low == top.bit)
+        parts.push_back(name + "[" + std::to_string(low) + "]");
+      else
+        parts.push_back(name + "[" + std::to_string(top.bit) + ":" +
+                        std::to_string(low) + "]");
+    }
+    hi = lo;
+  }
+  if (parts.size() == 1)
+    return parts[0];
+  std::string result = "{";
+  llvm::interleave(
+      parts, [&](auto &part) { result += part; }, [&] { result += ", "; });
+  return result + "}";
+}
+
+/// Whether the parent's own logic reads `value`, rather than only the inputs
+/// of the models being cut out.
+static bool isReadByParent(Value value, const DenseSet<Operation *> &models,
+                           DenseMap<Value, bool> &read) {
+  if (auto it = read.find(value); it != read.end())
+    return it->second;
+  read[value] = false;
+  bool result = llvm::any_of(value.getUsers(), [&](Operation *user) {
+    if (models.contains(user))
+      return false;
+    if (!BitTracer::isWiring(user) &&
+        !isa<comb::CombDialect>(user->getDialect()))
+      return true;
+    return llvm::any_of(user->getResults(), [&](Value result) {
+      return isReadByParent(result, models, read);
+    });
+  });
+  return read[value] = result;
+}
+
 /// For each output of a model, the bits that are always the same constant.
 static SmallVector<BitSources> getConstantOutputs(hw::HWModuleOp model) {
   auto *body = model.getBodyBlock();
@@ -310,12 +376,32 @@ void MaxsimExtractModelsPass::runOnOperation() {
         constantOutputs[name] = getConstantOutputs(model);
   }
 
-  // Each model input becomes an output of the parent, unless inputs of the
-  // parent drive it, with constants: the model is connected to those directly.
-  // One that only constants drive is a channel of tokens, with no bits.
+  // Each model input becomes an output of the parent, unless it is wired from
+  // inputs of the parent and constants, or is an output of a model: it is
+  // connected to those directly. One that only constants drive is a channel of
+  // tokens, with no bits.
   BitTracer tracer(ports, /*throughRegisters=*/false);
   auto builder = ImplicitLocOpBuilder::atBlockTerminator(parent.getLoc(), body);
   SmallVector<std::pair<StringAttr, Value>> newOutputs;
+  DenseMap<Value, std::string> portNames;
+  for (auto [index, arg] : llvm::enumerate(body->getArguments()))
+    portNames[arg] = parent.getInputName(index).str();
+  for (auto instance : instances)
+    for (auto [result, name] :
+         llvm::zip(instance.getResults(), instance.getResultNames()))
+      portNames[result] = sanitize(instance.getInstanceName()) + "_" +
+                          cast<StringAttr>(name).getValue().str();
+  SmallVector<Attribute> directInputs;
+  auto hasConstantBits = [&](Value output) {
+    auto result = cast<OpResult>(output);
+    auto instance = cast<hw::InstanceOp>(result.getOwner());
+    auto constants =
+        constantOutputs.lookup(instance.getModuleNameAttr().getAttr());
+    return !constants.empty() &&
+           llvm::any_of(constants[result.getResultNumber()], [](auto &bit) {
+             return bit.kind == BitSource::Constant;
+           });
+  };
   for (auto instance : instances) {
     auto base = sanitize(instance.getInstanceName());
     for (auto [operand, name] :
@@ -327,29 +413,52 @@ void MaxsimExtractModelsPass::runOnOperation() {
       auto isConstant = [](auto &source) {
         return source.kind == BitSource::Constant;
       };
+      // Wired from inputs of the parent and constants, or exactly one output
+      // of a model with no constant bits, which is a channel as a whole.
       bool direct = llvm::all_of(sources, [&](auto &source) {
         return isConstant(source) || (source.kind == BitSource::Port &&
                                       isa<BlockArgument>(source.port));
       });
-      if (direct && !llvm::all_of(sources, isConstant))
+      if (!direct && !sources.empty()) {
+        auto output = sources[0].port;
+        direct = output && !isa<BlockArgument>(output) &&
+                 hw::getBitWidth(output.getType()) == width &&
+                 !hasConstantBits(output) &&
+                 llvm::all_of(llvm::enumerate(sources), [&](auto bit) {
+                   return bit.value().kind == BitSource::Port &&
+                          bit.value().port == output &&
+                          bit.value().bit == bit.index();
+                 });
+      }
+      auto portName = base + "_" + cast<StringAttr>(name).getValue().str();
+      if (direct && !llvm::all_of(sources, isConstant)) {
+        directInputs.push_back(builder.getStringAttr(
+            portName + " = " +
+            describe(sources, [&](Value port) { return portNames[port]; })));
         continue;
+      }
       Value value = operand;
       if (direct)
         value = hw::ConstantOp::create(builder, builder.getIntegerType(0), 0);
       else if (!value.getType().isInteger(width))
         value = hw::BitcastOp::create(builder, builder.getIntegerType(width),
                                       value);
-      newOutputs.push_back({builder.getStringAttr(
-                                base + "_" + cast<StringAttr>(name).getValue()),
-                            value});
+      newOutputs.push_back({builder.getStringAttr(portName), value});
     }
   }
+  if (!directInputs.empty())
+    parent->setAttr("maxsim.direct_inputs", builder.getArrayAttr(directInputs));
   if (!newOutputs.empty())
     parent.insertOutputs(parent.getNumOutputPorts(), newOutputs);
 
   // Each model output becomes inputs of its bits, but for those that are
-  // always the same constant.
+  // always the same constant. One the parent's logic does not read, only the
+  // models it is wired to, is a channel of tokens, with no bits.
   builder.setInsertionPoint(body, body->begin());
+  DenseSet<Operation *> modelOps;
+  for (auto instance : instances)
+    modelOps.insert(instance);
+  DenseMap<Value, bool> readByParent;
   for (auto instance : instances) {
     auto base = sanitize(instance.getInstanceName());
     auto constants =
@@ -379,7 +488,22 @@ void MaxsimExtractModelsPass::runOnOperation() {
           value.setBitVal(bit - lo, (*bits)[bit].value);
         parts.push_back(hw::ConstantOp::create(builder, value));
       };
-      if (auto it = givenInputs.find(portBase); it != givenInputs.end()) {
+      auto givenIt = givenInputs.find(portBase);
+      bool allConstant = bits && llvm::all_of(*bits, [](auto &source) {
+                           return source.kind == BitSource::Constant;
+                         });
+      if (givenIt == givenInputs.end() && !allConstant &&
+          !isReadByParent(result, modelOps, readByParent)) {
+        parent.appendInput(portBase, builder.getIntegerType(0));
+        if (!result.use_empty()) {
+          Value zero = hw::ConstantOp::create(builder, APInt::getZero(width));
+          if (zero.getType() != result.getType())
+            zero = hw::BitcastOp::create(builder, result.getType(), zero);
+          result.replaceAllUsesWith(zero);
+        }
+        continue;
+      }
+      if (auto it = givenIt; it != givenInputs.end()) {
         // The inputs are given; the bits they leave out must be constants.
         auto ranges = it->second;
         llvm::sort(ranges, [](auto a, auto b) { return a.second < b.second; });
