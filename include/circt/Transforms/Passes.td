@@ -257,6 +257,40 @@ def CellIFTInstrument : Pass<"cellift-instrument", "::mlir::ModuleOp"> {
   ];
 }
 
+def MaxsimExtractModels : Pass<"maxsim-extract-models", "::mlir::ModuleOp"> {
+  let summary = "Cut the instances of separately simulated models out of a "
+                "parent";
+  let description = [{
+    FireSim's Golden Gate simulates each partitioned class as its own model,
+    connected to the others by channels. This pass removes the instances of
+    the `models` modules from the flat `module`, leaving it with ports for
+    what it exchanges with them, named `<instance>_<port>`:
+
+    - An input of an instance becomes an output of the parent, unless inputs
+      of the parent drive it, with constants: the instance is then connected
+      to those directly. One that only constants drive becomes an output of
+      no bits, a channel of tokens only.
+    - An output of an instance becomes an input of the parent, but for the
+      bits that are always the same constant in the model, which the parent
+      uses instead. Those are found through wiring and through register bits
+      whose next and reset values are that constant. The inputs for the other
+      bits are named `<instance>_<port>_<hi>_<lo>_`, or
+      `<instance>_<port>_<bit>_` for one, when they are not all of them.
+
+    Clock ports are left out, as models take their clock from the simulator.
+  }];
+  let options = [
+    Option<"moduleName", "module", "std::string", "",
+           "The parent to cut the models out of">,
+    ListOption<"models", "models", "std::string",
+               "The modules simulated as separate models">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect"
+  ];
+}
+
 def MaxsimFAME5 : Pass<"maxsim-fame5", "::mlir::ModuleOp"> {
   let summary = "Thread a flat model's state for FireSim's FAME-5 simulation";
   let description = [{
