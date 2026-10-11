@@ -433,7 +433,7 @@ LogicalResult Threader::run() {
   computeDeps();
 
   // The threaded module's ports: the host clock and reset, then a decoupled
-  // channel per target port, inputs first.
+  // channel per target port, inputs first, its bits flat as Golden Gate's.
   auto *context = model.getContext();
   auto i1 = IntegerType::get(context, 1);
   SmallVector<hw::PortInfo> ports;
@@ -452,13 +452,15 @@ LogicalResult Threader::run() {
   for (auto &channel : inputs) {
     addPort(channel.name.getValue() + "_sink_ready", i1, false);
     addPort(channel.name.getValue() + "_sink_valid", i1, true);
-    addPort(channel.name.getValue() + "_sink_bits", channel.type, true);
+    addPort(channel.name.getValue() + "_sink_bits",
+            IntegerType::get(context, hw::getBitWidth(channel.type)), true);
   }
   for (auto &channel : outputs) {
     addPort(channel.name.getValue() + "_source_ready", i1, true);
     addPort(channel.name.getValue() + "_source_valid", i1, false);
     if (hw::getBitWidth(channel.type) > 0)
-      addPort(channel.name.getValue() + "_source_bits", channel.type, false);
+      addPort(channel.name.getValue() + "_source_bits",
+              IntegerType::get(context, hw::getBitWidth(channel.type)), false);
   }
 
   OpBuilder top(model);
@@ -503,9 +505,9 @@ LogicalResult Threader::run() {
       // Channels of a port are in ascending bit order; concat wants the most
       // significant first.
       std::reverse(parts.begin(), parts.end());
-      value = b.createOrFold<hw::BitcastOp>(
-          arg.getType(), b.createOrFold<comb::ConcatOp>(parts));
+      value = b.createOrFold<comb::ConcatOp>(parts);
     }
+    value = b.createOrFold<hw::BitcastOp>(arg.getType(), value);
     arg.replaceAllUsesWith(value);
     replaced[arg] = value;
   }
@@ -730,10 +732,12 @@ LogicalResult Threader::run() {
     results.push_back(outValid[i]);
     if (hw::getBitWidth(channel.type) == 0)
       continue;
-    results.push_back(channel.eager
-                          ? Value(comb::MuxOp::create(
-                                b, outFired[i], channel.next, channel.current))
-                          : channel.current);
+    Value bits = channel.eager
+                     ? Value(comb::MuxOp::create(b, outFired[i], channel.next,
+                                                 channel.current))
+                     : channel.current;
+    results.push_back(b.createOrFold<hw::BitcastOp>(
+        b.getIntegerType(hw::getBitWidth(channel.type)), bits));
   }
   hw::OutputOp::create(b, results);
 
