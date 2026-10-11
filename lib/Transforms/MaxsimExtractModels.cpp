@@ -376,10 +376,10 @@ void MaxsimExtractModelsPass::runOnOperation() {
         constantOutputs[name] = getConstantOutputs(model);
   }
 
-  // Each model input becomes an output of the parent, unless it is wired from
-  // inputs of the parent and constants, or is an output of a model: it is
-  // connected to those directly. One that only constants drive is a channel of
-  // tokens, with no bits.
+  // Each model input the model reads becomes an output of the parent, unless it
+  // is wired from inputs of the parent and constants, or is an output of a
+  // model: it is connected to those directly. One that only constants drive is
+  // a channel of tokens, with no bits.
   BitTracer tracer(ports, /*throughRegisters=*/false);
   auto builder = ImplicitLocOpBuilder::atBlockTerminator(parent.getLoc(), body);
   SmallVector<std::pair<StringAttr, Value>> newOutputs;
@@ -404,10 +404,15 @@ void MaxsimExtractModelsPass::runOnOperation() {
   };
   for (auto instance : instances) {
     auto base = sanitize(instance.getInstanceName());
-    for (auto [operand, name] :
-         llvm::zip(instance.getInputs(), instance.getArgNames())) {
+    auto model = dyn_cast_or_null<hw::HWModuleOp>(SymbolTable::lookupSymbolIn(
+        top, instance.getModuleNameAttr().getAttr()));
+    for (auto [index, operand, name] :
+         llvm::enumerate(instance.getInputs(), instance.getArgNames())) {
       auto width = hw::getBitWidth(operand.getType());
       if (isa<seq::ClockType>(operand.getType()) || width <= 0)
+        continue;
+      // An input the model does not read is not a channel of the model.
+      if (model && model.getBodyBlock()->getArgument(index).use_empty())
         continue;
       auto &sources = tracer.get(operand);
       auto isConstant = [](auto &source) {
