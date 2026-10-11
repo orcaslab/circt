@@ -100,6 +100,8 @@ private:
 
   unsigned clockArg = 0;
   SmallVector<Channel> inputs, outputs;
+  /// The outputs that are inputs wired through, as `output = input`.
+  SmallVector<Attribute> bypasses;
   SmallVector<seq::FirRegOp> registers;
   SmallVector<seq::FirMemOp> memories;
   DenseMap<Value, bool> memoryDeps;
@@ -113,6 +115,59 @@ private:
 };
 
 } // namespace
+
+/// The input whose bits `value` is, in order, wired through the ops that only
+/// move bits around, or null.
+static BlockArgument getWiredInput(Value value) {
+  auto width = hw::getBitWidth(value.getType());
+  // Where bit `bit` of `v` comes from, if from an input.
+  std::function<std::pair<BlockArgument, int64_t>(Value, int64_t)> source =
+      [&](Value v, int64_t bit) -> std::pair<BlockArgument, int64_t> {
+    if (auto arg = dyn_cast<BlockArgument>(v))
+      return {arg, bit};
+    auto *op = v.getDefiningOp();
+    APInt index;
+    if (isa_and_nonnull<hw::BitcastOp>(op))
+      return source(op->getOperand(0), bit);
+    if (auto extract = dyn_cast_or_null<comb::ExtractOp>(op))
+      return source(extract.getInput(), extract.getLowBit() + bit);
+    if (isa_and_nonnull<comb::ConcatOp, hw::ArrayCreateOp, hw::StructCreateOp>(
+            op)) {
+      // Operands are listed from the most significant one.
+      for (auto operand : llvm::reverse(op->getOperands())) {
+        auto w = hw::getBitWidth(operand.getType());
+        if (bit < w)
+          return source(operand, bit);
+        bit -= w;
+      }
+      return {};
+    }
+    if (auto get = dyn_cast_or_null<hw::ArrayGetOp>(op);
+        get && matchPattern(get.getIndex(), m_ConstantInt(&index)))
+      return source(get.getInput(),
+                    index.getZExtValue() * hw::getBitWidth(get.getType()) +
+                        bit);
+    if (auto extract = dyn_cast_or_null<hw::StructExtractOp>(op)) {
+      auto elements =
+          hw::type_cast<hw::StructType>(extract.getInput().getType())
+              .getElements();
+      for (auto &element : elements.drop_front(extract.getFieldIndex() + 1))
+        bit += hw::getBitWidth(element.type);
+      return source(extract.getInput(), bit);
+    }
+    return {};
+  };
+  BlockArgument input;
+  for (int64_t bit = 0; bit < width; ++bit) {
+    auto [arg, argBit] = source(value, bit);
+    if (!arg || argBit != bit || (input && arg != input))
+      return {};
+    input = arg;
+  }
+  if (!input || hw::getBitWidth(input.getType()) != width)
+    return {};
+  return input;
+}
 
 LogicalResult Threader::checkModel() {
   auto *body = model.getBodyBlock();
@@ -128,13 +183,24 @@ LogicalResult Threader::checkModel() {
       continue;
     }
     bool isInput = port.dir == hw::ModulePort::Direction::Input;
-    // An input the model does not read would only hold its threads back.
-    if (isInput && body->getArgument(port.argNum).use_empty())
-      continue;
-    // An output of no bits is a channel of tokens only.
+    // A port of no bits is a channel of tokens only. An input of bits the model
+    // does not read would only hold its threads back.
     auto width = hw::getBitWidth(port.type);
-    if (width < 0 || (width == 0 && isInput))
+    if (width < 0)
       return model.emitError("port '") << port.name << "' has no bit width";
+    if (isInput && width > 0 && body->getArgument(port.argNum).use_empty())
+      continue;
+    // An output that is an input, wired through, is not a channel of the
+    // model: the input's tokens go to it around the model.
+    if (!isInput && width > 0) {
+      auto output = body->getTerminator()->getOperand(port.argNum);
+      if (auto input = getWiredInput(output)) {
+        bypasses.push_back(StringAttr::get(
+            model.getContext(), port.name.getValue() + " = " +
+                                    model.getInputName(input.getArgNumber())));
+        continue;
+      }
+    }
     auto &channels = isInput ? inputs : outputs;
     SmallVector<unsigned> bitChannels(width, channels.size());
 
@@ -606,8 +672,9 @@ LogicalResult Threader::run() {
   for (auto &channel : inputs) {
     addPort(channel.name.getValue() + "_sink_ready", i1, false);
     addPort(channel.name.getValue() + "_sink_valid", i1, true);
-    addPort(channel.name.getValue() + "_sink_bits",
-            IntegerType::get(context, hw::getBitWidth(channel.type)), true);
+    if (hw::getBitWidth(channel.type) > 0)
+      addPort(channel.name.getValue() + "_sink_bits",
+              IntegerType::get(context, hw::getBitWidth(channel.type)), true);
   }
   for (auto &channel : outputs) {
     addPort(channel.name.getValue() + "_source_ready", i1, true);
@@ -625,12 +692,17 @@ LogicalResult Threader::run() {
   hostClock = body->getArgument(0);
   Value hostReset = body->getArgument(1);
   SmallVector<Value> sinkValid, sinkBits, sourceReady;
-  for (unsigned i = 0; i < inputs.size(); ++i) {
-    sinkValid.push_back(body->getArgument(2 + 2 * i));
-    sinkBits.push_back(body->getArgument(3 + 2 * i));
+  unsigned arg = 2;
+  ImplicitLocOpBuilder top0(model.getLoc(), body, body->begin());
+  for (auto &channel : inputs) {
+    sinkValid.push_back(body->getArgument(arg++));
+    sinkBits.push_back(
+        hw::getBitWidth(channel.type) > 0
+            ? Value(body->getArgument(arg++))
+            : hw::ConstantOp::create(top0, top0.getIntegerType(0), 0));
   }
   for (unsigned i = 0; i < outputs.size(); ++i)
-    sourceReady.push_back(body->getArgument(2 + 2 * inputs.size() + i));
+    sourceReady.push_back(body->getArgument(arg++));
 
   // The target logic moves into the threaded module as is, reading the
   // input channels' bits.
@@ -909,6 +981,8 @@ LogicalResult Threader::run() {
     if (channel.eager)
       eager.push_back(channel.name);
   threaded->setAttr("maxsim.eager_channels", b.getArrayAttr(eager));
+  if (!bypasses.empty())
+    threaded->setAttr("maxsim.bypass", b.getArrayAttr(bypasses));
   model.erase();
   return success();
 }
