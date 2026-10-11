@@ -272,6 +272,7 @@ def MaxsimFAME5 : Pass<"maxsim-fame5", "::mlir::ModuleOp"> {
       thread finishes its target cycle once every input is valid and every
       output has fired; outputs that do not depend combinationally on an input
       fire eagerly, with the next cycle's value once the thread has finished.
+      An input the model does not read has no channel.
     - The target clock is `hostClock` through a `FireSimFabricClockGate`,
       enabled when the current thread finishes.
 

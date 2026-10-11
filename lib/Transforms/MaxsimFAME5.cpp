@@ -92,6 +92,9 @@ private:
   unsigned clockArg = 0;
   SmallVector<Channel> inputs, outputs;
   SmallVector<seq::FirRegOp> registers;
+  SmallVector<seq::FirMemOp> memories;
+  DenseMap<Value, bool> memoryDeps;
+  bool dependsOnMemory(Value value);
   /// For each bit of an input port, the channel carrying it.
   DenseMap<Value, SmallVector<unsigned>> inputOfArg;
   DenseMap<Value, std::unique_ptr<BitDeps>> deps;
@@ -115,10 +118,14 @@ LogicalResult Threader::checkModel() {
       clockArg = port.argNum;
       continue;
     }
-    auto width = hw::getBitWidth(port.type);
-    if (width <= 0)
-      return model.emitError("port '") << port.name << "' has no bit width";
     bool isInput = port.dir == hw::ModulePort::Direction::Input;
+    // An input the model does not read would only hold its threads back.
+    if (isInput && body->getArgument(port.argNum).use_empty())
+      continue;
+    // An output of no bits is a channel of tokens only.
+    auto width = hw::getBitWidth(port.type);
+    if (width < 0 || (width == 0 && isInput))
+      return model.emitError("port '") << port.name << "' has no bit width";
     auto &channels = isInput ? inputs : outputs;
     SmallVector<unsigned> bitChannels(width, channels.size());
 
@@ -176,15 +183,30 @@ LogicalResult Threader::checkModel() {
       registers.push_back(reg);
       continue;
     }
-    if (isa<hw::OutputOp>(op))
+    if (auto memory = dyn_cast<seq::FirMemOp>(op)) {
+      if (memory.getInit())
+        return memory.emitError("initialized memory in a threaded model");
+      if (memory.getReadLatency() > 1 || memory.getWriteLatency() != 1)
+        return memory.emitError(
+            "a threaded memory has a read latency of 0 or 1 and a write "
+            "latency of 1");
+      if (!llvm::isPowerOf2_32(threads))
+        return memory.emitError("threading a memory needs a power of two of "
+                                "threads");
+      memories.push_back(memory);
+      continue;
+    }
+    if (isa<hw::OutputOp, seq::FirMemReadOp, seq::FirMemWriteOp>(op))
       continue;
     if (isa<hw::HWInstanceLike>(op) || op.getDialect()->getNamespace() == "seq")
       return op.emitError("a threaded model must be flat and keep its state "
-                          "in registers");
+                          "in registers and memories");
   }
   for (auto &use : body->getArgument(clockArg).getUses())
-    if (!isa<seq::FirRegOp>(use.getOwner()))
-      return use.getOwner()->emitError("clock used other than by a register");
+    if (!isa<seq::FirRegOp, seq::FirMemReadOp, seq::FirMemWriteOp>(
+            use.getOwner()))
+      return use.getOwner()->emitError(
+          "clock used other than by a register or memory");
   return success();
 }
 
@@ -218,6 +240,16 @@ const BitDeps &Threader::getDeps(Value value) {
   if (auto it = inputOfArg.find(value); it != inputOfArg.end()) {
     for (auto [bit, channel] : llvm::zip(bits, it->second))
       bit.set(channel);
+  } else if (auto read = dyn_cast_or_null<seq::FirMemReadOp>(op)) {
+    // A registered read is state; a combinational one follows its address.
+    auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+    if (!memory || memory.getReadLatency() == 0) {
+      llvm::BitVector any = all(read.getAddress());
+      if (read.getEnable())
+        any |= all(read.getEnable());
+      for (auto &bit : bits)
+        bit = any;
+    }
   } else if (!op ||
              isa<seq::FirRegOp, hw::ConstantOp, hw::AggregateConstantOp>(op)) {
     // Inputs of the threaded module's state only.
@@ -309,6 +341,24 @@ void Threader::computeDeps() {
     for (auto &bit : ArrayRef(getDeps(value)).slice(channel.low, width))
       channel.deps |= bit;
   }
+}
+
+/// Whether `value` is computed from a memory's read data. Golden Gate does not
+/// compute the next value of such an output, so it does not fire it eagerly.
+bool Threader::dependsOnMemory(Value value) {
+  if (auto it = memoryDeps.find(value); it != memoryDeps.end())
+    return it->second;
+  auto *op = value.getDefiningOp();
+  bool result = false;
+  if (isa_and_nonnull<seq::FirMemReadOp>(op)) {
+    result = true;
+  } else if (op && !isa<seq::FirRegOp>(op)) {
+    memoryDeps[value] = false;
+    result = llvm::any_of(op->getOperands(), [&](Value operand) {
+      return dependsOnMemory(operand);
+    });
+  }
+  return memoryDeps[value] = result;
 }
 
 bool Threader::dependsOnState(Value value) {
@@ -407,7 +457,8 @@ LogicalResult Threader::run() {
   for (auto &channel : outputs) {
     addPort(channel.name.getValue() + "_source_ready", i1, true);
     addPort(channel.name.getValue() + "_source_valid", i1, false);
-    addPort(channel.name.getValue() + "_source_bits", channel.type, false);
+    if (hw::getBitWidth(channel.type) > 0)
+      addPort(channel.name.getValue() + "_source_bits", channel.type, false);
   }
 
   OpBuilder top(model);
@@ -475,7 +526,7 @@ LogicalResult Threader::run() {
   // An output that depends on no input fires eagerly, with the next cycle's
   // value once its thread has finished.
   for (auto &channel : outputs) {
-    channel.eager = channel.deps.none();
+    channel.eager = channel.deps.none() && !dependsOnMemory(channel.current);
     if (channel.eager)
       channel.next = getNext(channel.current, b);
   }
@@ -491,6 +542,88 @@ LogicalResult Threader::run() {
     replaced[reg.getResult()] = value;
     writeThreadState(b, memory, targetClock, next);
     reg.erase();
+  }
+
+  // Each memory holds every thread's contents, the thread in the low address
+  // bits, and is written on the target clock. A registered read reads on the
+  // target clock too, and its data is kept per thread in a buffer filled on
+  // the next host cycle, as FireSim's FameRam does, so that the memory stays
+  // a block RAM.
+  Value edgeSeen;
+  auto getEdgeSeen = [&]() {
+    if (edgeSeen)
+      return edgeSeen;
+    auto zero = b.getIntegerAttr(i1, 0);
+    auto toggleNext = backedges.get(i1);
+    auto toggle = seq::FirRegOp::create(b, toggleNext, targetClock,
+                                        b.getStringAttr("target_toggle"),
+                                        hw::InnerSymAttr{}, zero);
+    toggleNext.setValue(
+        comb::XorOp::create(b, toggle, hw::ConstantOp::create(b, i1, 1)));
+    auto seen = seq::FirRegOp::create(b, toggle, hostClock,
+                                      b.getStringAttr("target_toggle_seen"),
+                                      hw::InnerSymAttr{}, zero);
+    edgeSeen = comb::XorOp::create(b, toggle, seen);
+    return edgeSeen;
+  };
+  auto idxWidth = threadIdx.getType().getIntOrFloatBitWidth();
+  for (auto memory : memories) {
+    auto memType = memory.getType();
+    auto depth = memType.getDepth() * threads;
+    auto threadedType = seq::FirMemType::get(
+        b.getContext(), depth, memType.getWidth(), memType.getMaskWidth());
+    auto threadedMemory = seq::FirMemOp::create(
+        b, threadedType, memory.getReadLatency(), memory.getWriteLatency(),
+        memory.getRuw(), memory.getWuw(), memory.getNameAttr(),
+        hw::InnerSymAttr{}, seq::FirMemInitAttr{}, memory.getPrefixAttr(),
+        memory.getOutputFileAttr());
+    threadedMemory->setDialectAttrs(memory->getDialectAttrs());
+    unsigned addrWidth = llvm::Log2_64_Ceil(depth) - idxWidth;
+    auto addressOf = [&](Value addr) -> Value {
+      if (!addrWidth)
+        return threadIdx;
+      Value low =
+          b.createOrFold<comb::ExtractOp>(b.getIntegerType(addrWidth), addr, 0);
+      return b.createOrFold<comb::ConcatOp>(low, threadIdx);
+    };
+    for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
+      if (auto write = dyn_cast<seq::FirMemWriteOp>(user)) {
+        seq::FirMemWriteOp::create(
+            b, threadedMemory, addressOf(write.getAddress()), targetClock,
+            write.getEnable(), write.getData(), write.getMask());
+        write.erase();
+        continue;
+      }
+      auto read = cast<seq::FirMemReadOp>(user);
+      Value data;
+      if (memory.getReadLatency() == 0) {
+        data = seq::FirMemReadOp::create(b, threadedMemory,
+                                         addressOf(read.getAddress()),
+                                         hostClock, read.getEnable());
+      } else {
+        Value dout = seq::FirMemReadOp::create(b, threadedMemory,
+                                               addressOf(read.getAddress()),
+                                               targetClock, read.getEnable());
+        Value enable = read.getEnable()
+                           ? read.getEnable()
+                           : Value(hw::ConstantOp::create(b, i1, 1));
+        auto readEdge = seq::FirRegOp::create(b, enable, targetClock,
+                                              b.getStringAttr("read_edge"));
+        auto readThread = seq::FirRegOp::create(b, threadIdx, targetClock,
+                                                b.getStringAttr("read_thread"));
+        Value buffer;
+        data = createThreadState(
+            b, (memory.getName().value_or("mem") + "_rdata").str(),
+            dout.getType(), buffer);
+        seq::FirMemWriteOp::create(
+            b, buffer, readThread, hostClock,
+            comb::AndOp::create(b, getEdgeSeen(), readEdge), dout, Value{});
+      }
+      read.getData().replaceAllUsesWith(data);
+      replaced[read.getData()] = data;
+      read.erase();
+    }
+    memory.erase();
   }
 
   auto resolve = [&](Value value) {
@@ -595,6 +728,8 @@ LogicalResult Threader::run() {
   SmallVector<Value> results(sinkReady);
   for (auto [i, channel] : llvm::enumerate(outputs)) {
     results.push_back(outValid[i]);
+    if (hw::getBitWidth(channel.type) == 0)
+      continue;
     results.push_back(channel.eager
                           ? Value(comb::MuxOp::create(
                                 b, outFired[i], channel.next, channel.current))
