@@ -65,9 +65,10 @@ public:
   using Slices = llvm::StringMap<SmallVector<std::pair<unsigned, unsigned>>>;
 
   Threader(hw::HWModuleOp model, unsigned threads, StringAttr name,
-           hw::HWModuleExternOp gate, const Slices &slices)
-      : model(model), threads(threads), name(name), gate(gate), slices(slices) {
-  }
+           hw::HWModuleExternOp gate, const Slices &slices,
+           StringRef clockChannel)
+      : model(model), threads(threads), name(name), gate(gate), slices(slices),
+        clockChannel(clockChannel) {}
 
   LogicalResult run();
 
@@ -77,7 +78,8 @@ private:
   const BitDeps &getDeps(Value value);
   Value getNext(Value value, ImplicitLocOpBuilder &b);
   bool dependsOnState(Value value);
-  /// A memory of one entry per thread, read at the current thread.
+  /// A memory of one entry per thread, read at the current thread; a register
+  /// for a single thread.
   Value createThreadState(ImplicitLocOpBuilder &b, StringRef stateName,
                           Type type, Value &memory);
   void writeThreadState(ImplicitLocOpBuilder &b, Value memory, Value clock,
@@ -97,6 +99,12 @@ private:
   StringAttr name;
   hw::HWModuleExternOp gate;
   const Slices &slices;
+  /// The channel the target clock comes in on, if any.
+  StringRef clockChannel;
+  /// A single thread's state: the registers not written yet, with their next
+  /// value and clock to be.
+  DenseMap<Value, std::pair<Backedge, Backedge>> unwritten;
+  std::unique_ptr<BackedgeBuilder> registers1;
 
   unsigned clockArg = 0;
   SmallVector<Channel> inputs, outputs;
@@ -482,6 +490,14 @@ Value Threader::getNext(Value value, ImplicitLocOpBuilder &b) {
 Value Threader::createThreadState(ImplicitLocOpBuilder &b, StringRef stateName,
                                   Type type, Value &memory) {
   auto width = hw::getBitWidth(type);
+  if (threads == 1) {
+    // Its write gives the register its next value and clock.
+    auto next = registers1->get(b.getIntegerType(width));
+    auto clock = registers1->get(seq::ClockType::get(b.getContext()));
+    memory = seq::FirRegOp::create(b, next, clock, b.getStringAttr(stateName));
+    unwritten.try_emplace(memory, next, clock);
+    return b.createOrFold<hw::BitcastOp>(type, memory);
+  }
   auto memType = seq::FirMemType::get(b.getContext(), threads, width, 1);
   memory = seq::FirMemOp::create(
       b, memType, /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined,
@@ -495,6 +511,16 @@ Value Threader::createThreadState(ImplicitLocOpBuilder &b, StringRef stateName,
 
 void Threader::writeThreadState(ImplicitLocOpBuilder &b, Value memory,
                                 Value clock, Value data, Value enable) {
+  if (threads == 1) {
+    auto it = unwritten.find(memory);
+    auto [next, regClock] = it->second;
+    data = b.createOrFold<hw::BitcastOp>(memory.getType(), data);
+    next.setValue(enable ? b.createOrFold<comb::MuxOp>(enable, data, memory)
+                         : data);
+    regClock.setValue(clock);
+    unwritten.erase(it);
+    return;
+  }
   auto width = cast<seq::FirMemType>(memory.getType()).getWidth();
   data = b.createOrFold<hw::BitcastOp>(b.getIntegerType(width), data);
   if (!enable)
@@ -669,6 +695,12 @@ LogicalResult Threader::run() {
   };
   addPort("hostClock", seq::ClockType::get(context), true);
   addPort("hostReset", i1, true);
+  // The target clock's channel carries whether each cycle's edge is enabled,
+  // and is always valid.
+  if (!clockChannel.empty()) {
+    addPort(clockChannel + "_sink_ready", i1, false);
+    addPort(clockChannel + "_sink_bits", i1, true);
+  }
   for (auto &channel : inputs) {
     addPort(channel.name.getValue() + "_sink_ready", i1, false);
     addPort(channel.name.getValue() + "_sink_valid", i1, true);
@@ -693,6 +725,9 @@ LogicalResult Threader::run() {
   Value hostReset = body->getArgument(1);
   SmallVector<Value> sinkValid, sinkBits, sourceReady;
   unsigned arg = 2;
+  Value clockBits;
+  if (!clockChannel.empty())
+    clockBits = body->getArgument(arg++);
   ImplicitLocOpBuilder top0(model.getLoc(), body, body->begin());
   for (auto &channel : inputs) {
     sinkValid.push_back(body->getArgument(arg++));
@@ -713,6 +748,7 @@ LogicalResult Threader::run() {
                                Block::iterator(modelOutput));
   ImplicitLocOpBuilder b(model.getLoc(), body, body->end());
   BackedgeBuilder backedges(b, model.getLoc());
+  registers1 = std::make_unique<BackedgeBuilder>(b, model.getLoc());
   auto targetClock = backedges.get(seq::ClockType::get(context));
   modelBody->getArgument(clockArg).replaceAllUsesWith(targetClock);
   // Values kept aside for the outputs may be replaced below.
@@ -739,17 +775,19 @@ LogicalResult Threader::run() {
   }
 
   // The current thread, advancing every host cycle.
-  auto idxType = b.getIntegerType(std::max(1u, llvm::Log2_32_Ceil(threads)));
-  auto idxNext = backedges.get(idxType);
-  threadIdx = seq::FirRegOp::create(b, idxNext, hostClock,
-                                    b.getStringAttr("threadIdx"));
-  auto isLast =
-      comb::ICmpOp::create(b, comb::ICmpPredicate::eq, threadIdx,
-                           hw::ConstantOp::create(b, idxType, threads - 1));
-  idxNext.setValue(comb::MuxOp::create(
-      b, isLast, hw::ConstantOp::create(b, idxType, 0),
-      comb::AddOp::create(b, threadIdx,
-                          hw::ConstantOp::create(b, idxType, 1))));
+  if (threads > 1) {
+    auto idxType = b.getIntegerType(llvm::Log2_32_Ceil(threads));
+    auto idxNext = backedges.get(idxType);
+    threadIdx = seq::FirRegOp::create(b, idxNext, hostClock,
+                                      b.getStringAttr("threadIdx"));
+    auto isLast =
+        comb::ICmpOp::create(b, comb::ICmpPredicate::eq, threadIdx,
+                             hw::ConstantOp::create(b, idxType, threads - 1));
+    idxNext.setValue(comb::MuxOp::create(
+        b, isLast, hw::ConstantOp::create(b, idxType, 0),
+        comb::AddOp::create(b, threadIdx,
+                            hw::ConstantOp::create(b, idxType, 1))));
+  }
 
   // An output that depends on no input fires eagerly, with the next cycle's
   // value once its thread has finished.
@@ -801,7 +839,7 @@ LogicalResult Threader::run() {
     edgeSeen = comb::XorOp::create(b, toggle, seen);
     return edgeSeen;
   };
-  auto idxWidth = threadIdx.getType().getIntOrFloatBitWidth();
+  auto idxWidth = threads > 1 ? threadIdx.getType().getIntOrFloatBitWidth() : 0;
   for (auto memory : memories) {
     auto memType = memory.getType();
     auto depth = memType.getDepth() * threads;
@@ -815,6 +853,8 @@ LogicalResult Threader::run() {
     threadedMemory->setDialectAttrs(memory->getDialectAttrs());
     unsigned addrWidth = llvm::Log2_64_Ceil(depth) - idxWidth;
     auto addressOf = [&](Value addr) -> Value {
+      if (!idxWidth)
+        return addr;
       if (!addrWidth)
         return threadIdx;
       Value low =
@@ -831,7 +871,13 @@ LogicalResult Threader::run() {
       }
       auto read = cast<seq::FirMemReadOp>(user);
       Value data;
-      if (memory.getReadLatency() == 0) {
+      if (threads == 1) {
+        // One thread's registered read is the target's own.
+        data = seq::FirMemReadOp::create(
+            b, threadedMemory, read.getAddress(),
+            memory.getReadLatency() == 0 ? hostClock : targetClock,
+            read.getEnable());
+      } else if (memory.getReadLatency() == 0) {
         data = seq::FirMemReadOp::create(b, threadedMemory,
                                          addressOf(read.getAddress()),
                                          hostClock, read.getEnable());
@@ -893,8 +939,14 @@ LogicalResult Threader::run() {
     outFired.push_back(createThreadState(
         b, (channel.name.getValue() + "_fired").str(), i1, outMem.back()));
   }
+  // Whether the target clock ticks at the end of this cycle: with a clock
+  // channel, the edge its last token enabled; without, every cycle but the
+  // first after reset.
   Value clkEnabledMem;
-  auto clkEnabled = createThreadState(b, "clk_enabled", i1, clkEnabledMem);
+  auto clkEnabled = createThreadState(
+      b,
+      clockChannel.empty() ? "clk_enabled" : (clockChannel + "_enabled").str(),
+      i1, clkEnabledMem);
 
   // The thread finishes its target cycle when every input is valid and every
   // output has fired or fires now.
@@ -929,11 +981,15 @@ LogicalResult Threader::run() {
   auto unlessReset = [&](Value v) {
     return comb::MuxOp::create(b, hostReset, zero, v);
   };
+  // With a clock channel, a cycle whose edge is not enabled has no tokens: its
+  // outputs start out fired, as do its inputs.
   for (auto [i, channel] : llvm::enumerate(outputs)) {
     Value fired = outFired[i];
     Value onFinish = channel.eager
                          ? Value(comb::AndOp::create(b, fired, sourceReady[i]))
                          : Value(zero);
+    if (clockBits)
+      onFinish = comb::OrOp::create(b, notOf(clkEnabled), onFinish);
     writeThreadState(b, outMem[i], hostClock,
                      unlessReset(comb::MuxOp::create(b, finishing, onFinish,
                                                      firedOrFiring[i])));
@@ -944,6 +1000,15 @@ LogicalResult Threader::run() {
     sinkReady.push_back(ready);
     Value accepted = comb::OrOp::create(
         b, inFired[i], comb::AndOp::create(b, ready, sinkValid[i]));
+    if (clockBits) {
+      // Fired until the first clock token says which inputs a cycle takes.
+      writeThreadState(
+          b, inMem[i], hostClock,
+          comb::MuxOp::create(
+              b, hostReset, one,
+              comb::MuxOp::create(b, finishing, notOf(clockBits), accepted)));
+      continue;
+    }
     writeThreadState(
         b, inMem[i], hostClock,
         unlessReset(comb::MuxOp::create(b, finishing, zero, accepted)));
@@ -951,8 +1016,12 @@ LogicalResult Threader::run() {
 
   // The target clock ticks for the thread when it finishes, from its second
   // finish after reset on.
-  writeThreadState(b, clkEnabledMem, hostClock,
-                   unlessReset(comb::OrOp::create(b, finishing, clkEnabled)));
+  writeThreadState(
+      b, clkEnabledMem, hostClock,
+      unlessReset(
+          clockBits
+              ? Value(comb::MuxOp::create(b, finishing, clockBits, clkEnabled))
+              : Value(comb::OrOp::create(b, finishing, clkEnabled))));
   Value enable = comb::AndOp::create(
       b, ValueRange{clkEnabled, finishing, notOf(hostReset)}, false);
   auto clockGate =
@@ -960,7 +1029,10 @@ LogicalResult Threader::run() {
                              ArrayRef<Value>{hostClock, enable});
   targetClock.setValue(clockGate.getResult(0));
 
-  SmallVector<Value> results(sinkReady);
+  SmallVector<Value> results;
+  if (clockBits)
+    results.push_back(finishing);
+  results.append(sinkReady.begin(), sinkReady.end());
   for (auto [i, channel] : llvm::enumerate(outputs)) {
     results.push_back(outValid[i]);
     if (hw::getBitWidth(channel.type) == 0)
@@ -973,6 +1045,14 @@ LogicalResult Threader::run() {
         b.getIntegerType(hw::getBitWidth(channel.type)), bits));
   }
   hw::OutputOp::create(b, results);
+
+  // A single thread's state that is never written holds its value.
+  for (auto &[memory, entry] : unwritten) {
+    auto [next, regClock] = entry;
+    next.setValue(memory);
+    regClock.setValue(hostClock);
+  }
+  unwritten.clear();
 
   // Which output channels fire eagerly is part of the model's timing, which
   // the simulator around it relies on.
@@ -995,8 +1075,12 @@ void MaxsimFAME5Pass::runOnOperation() {
     top.emitError("no module '") << moduleName << "' to thread";
     return signalPassFailure();
   }
-  if (threads < 2) {
-    model.emitError("threading needs at least two threads");
+  if (threads < 1) {
+    model.emitError("a model simulates at least one instance");
+    return signalPassFailure();
+  }
+  if (!clockChannel.empty() && threads > 1) {
+    model.emitError("a clock channel is for a model of one instance");
     return signalPassFailure();
   }
 
@@ -1037,6 +1121,6 @@ void MaxsimFAME5Pass::runOnOperation() {
     }
     slices[fields[0]].push_back({hi, lo});
   }
-  if (failed(Threader(model, threads, name, gate, slices).run()))
+  if (failed(Threader(model, threads, name, gate, slices, clockChannel).run()))
     return signalPassFailure();
 }

@@ -315,7 +315,10 @@ def MaxsimFAME5 : Pass<"maxsim-fame5", "::mlir::ModuleOp"> {
       enabled when the current thread finishes.
 
     The module must be flat, with one clock input, and registers without
-    asynchronous reset.
+    asynchronous reset. A model of one instance keeps its state in registers;
+    its target clock may come in on a channel (`clock-channel`), as from
+    FireSim's clock bridge: then a cycle whose edge is not enabled has no
+    tokens, and the first token only says which inputs the first cycle takes.
   }];
   let options = [
     Option<"moduleName", "module", "std::string", "",
@@ -329,6 +332,9 @@ def MaxsimFAME5 : Pass<"maxsim-fame5", "::mlir::ModuleOp"> {
                "Ports split into channels of some of their bits, as "
                "<port>:<hi>:<lo>; a channel is named <port>_<hi>_<lo>_, or "
                "<port>_<hi>_ for one bit">,
+    Option<"clockChannel", "clock-channel", "std::string", "",
+           "For a model of one instance: the channel its target clock comes "
+           "in on, whose tokens say whether each cycle's edge is enabled">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
