@@ -257,4 +257,45 @@ def CellIFTInstrument : Pass<"cellift-instrument", "::mlir::ModuleOp"> {
   ];
 }
 
+def MaxsimFAME5 : Pass<"maxsim-fame5", "::mlir::ModuleOp"> {
+  let summary = "Thread a flat model's state for FireSim's FAME-5 simulation";
+  let description = [{
+    Turns a flat `hw.module`, the model of one class of identical instances,
+    into the FAME-5 multithreaded model FireSim's Golden Gate builds for it:
+    one module simulating all `threads` instances, one host cycle per thread
+    in turn, with each target port a latency-insensitive channel.
+
+    - Every register becomes a memory of one entry per thread, read
+      combinationally at the current thread and written on the target clock.
+    - Each target port `P` becomes a decoupled channel: an input becomes
+      `P_sink_{ready,valid,bits}`, an output `P_source_{ready,valid,bits}`. A
+      thread finishes its target cycle once every input is valid and every
+      output has fired; outputs that do not depend combinationally on an input
+      fire eagerly, with the next cycle's value once the thread has finished.
+    - The target clock is `hostClock` through a `FireSimFabricClockGate`,
+      enabled when the current thread finishes.
+
+    The module must be flat, with one clock input, and registers without
+    asynchronous reset.
+  }];
+  let options = [
+    Option<"moduleName", "module", "std::string", "",
+           "The model to thread">,
+    Option<"threads", "threads", "unsigned", "0",
+           "The number of instances the model simulates">,
+    Option<"threadedName", "threaded-name", "std::string", "",
+           "The name of the threaded module (default: the model's name with "
+           "`_threaded_<name>`)">,
+    ListOption<"portSlices", "port-slices", "std::string",
+               "Ports split into channels of some of their bits, as "
+               "<port>:<hi>:<lo>; a channel is named <port>_<hi>_<lo>_, or "
+               "<port>_<hi>_ for one bit">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect",
+    "circt::seq::SeqDialect"
+  ];
+}
+
 #endif // CIRCT_TRANSFORMS_PASSES
