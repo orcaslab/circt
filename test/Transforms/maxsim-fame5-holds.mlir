@@ -39,3 +39,14 @@ hw.module @Wired(in %clk : !seq.clock, in %en : i1, in %d : i8, out q : i6) {
   %r = seq.firreg %n clock %clk : i6
   hw.output %r : i6
 }
+
+// RUN: circt-opt %s --maxsim-fame5="module=Hold threads=4 clock-enable thread-index" | FileCheck %s --check-prefix=CE
+
+// With a clock enable there is no clock gate: the state is written on the host
+// clock, enabled when its thread finishes, and the thread is an output.
+// CE-LABEL: hw.module @Hold_threaded_Hold(
+// CE-SAME:    out threadIdx : i2, out finish : i1)
+// CE-NOT:   FireSimFabricClockGate
+// CE:       seq.firmem.write_port %r[%threadIdx] = %d_sink_bits, clock %hostClock enable [[EN:%.+]] :
+// CE:       [[EN]] = comb.and %en_sink_bits, {{%.+}} : i1
+// CE:       hw.output {{.*}}, %threadIdx, {{%.+}} : {{.*}}, i2, i1

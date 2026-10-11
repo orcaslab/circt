@@ -322,7 +322,8 @@ def MaxsimFAME5 : Pass<"maxsim-fame5", "::mlir::ModuleOp"> {
       fire eagerly, with the next cycle's value once the thread has finished.
       An input the model does not read has no channel.
     - The target clock is `hostClock` through a `FireSimFabricClockGate`,
-      enabled when the current thread finishes.
+      enabled when the current thread finishes; or, with `clock-enable`, the
+      host clock itself, every target register and memory port enabled then.
 
     The module must be flat, with one clock input, and registers without
     asynchronous reset. A model of one instance keeps its state in registers;
@@ -349,6 +350,11 @@ def MaxsimFAME5 : Pass<"maxsim-fame5", "::mlir::ModuleOp"> {
     Option<"clockChannel", "clock-channel", "std::string", "",
            "For a model of one instance: the channel its target clock comes "
            "in on, whose tokens say whether each cycle's edge is enabled">,
+    Option<"clockEnable", "clock-enable", "bool", "false",
+           "Write the target state on the host clock when the thread "
+           "finishes, rather than on a gated target clock">,
+    Option<"threadIndex", "thread-index", "bool", "false",
+           "Output the current thread on a `threadIdx` port">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
