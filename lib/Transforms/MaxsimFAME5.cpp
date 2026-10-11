@@ -437,8 +437,115 @@ void Threader::writeThreadState(ImplicitLocOpBuilder &b, Value memory,
                              Value{});
 }
 
+/// Bits `[low, low + width)` of the integer `value`, looking through wiring.
+static Value sliceBits(ImplicitLocOpBuilder &b, Value value, unsigned low,
+                       unsigned width) {
+  if (low == 0 && hw::getBitWidth(value.getType()) == width)
+    return value;
+  if (auto extract = value.getDefiningOp<comb::ExtractOp>())
+    return sliceBits(b, extract.getInput(), extract.getLowBit() + low, width);
+  if (auto concat = value.getDefiningOp<comb::ConcatOp>()) {
+    // The operands are most significant first.
+    SmallVector<Value> pieces;
+    unsigned operandLow = hw::getBitWidth(concat.getType());
+    for (auto operand : concat.getInputs()) {
+      unsigned operandWidth = hw::getBitWidth(operand.getType());
+      operandLow -= operandWidth;
+      unsigned lo = std::max(low, operandLow);
+      unsigned hi = std::min(low + width, operandLow + operandWidth);
+      if (lo < hi)
+        pieces.push_back(sliceBits(b, operand, lo - operandLow, hi - lo));
+    }
+    return pieces.size() == 1 ? pieces[0]
+                              : b.createOrFold<comb::ConcatOp>(pieces);
+  }
+  return b.createOrFold<comb::ExtractOp>(value, low, width);
+}
+
+/// The concatenation of `pieces`, adjacent slices of one value joined.
+static Value joinBits(ImplicitLocOpBuilder &b, ArrayRef<Value> pieces) {
+  SmallVector<Value> joined;
+  for (auto piece : pieces) {
+    auto extract = piece.getDefiningOp<comb::ExtractOp>();
+    auto last = joined.empty() ? comb::ExtractOp()
+                               : joined.back().getDefiningOp<comb::ExtractOp>();
+    if (extract && last && last.getInput() == extract.getInput() &&
+        extract.getLowBit() + hw::getBitWidth(extract.getType()) ==
+            last.getLowBit()) {
+      joined.back() = sliceBits(b, extract.getInput(), extract.getLowBit(),
+                                hw::getBitWidth(extract.getType()) +
+                                    hw::getBitWidth(last.getType()));
+      continue;
+    }
+    joined.push_back(piece);
+  }
+  return joined.size() == 1 ? joined[0]
+                            : b.createOrFold<comb::ConcatOp>(joined);
+}
+
+/// `value` as `type`, looking through bitcasts.
+static Value castBits(ImplicitLocOpBuilder &b, Value value, Type type) {
+  if (value.getType() == type)
+    return value;
+  if (auto cast = value.getDefiningOp<hw::BitcastOp>())
+    return castBits(b, cast.getInput(), type);
+  return b.createOrFold<hw::BitcastOp>(type, value);
+}
+
+/// `value` with the mux below its wiring (bitcasts, extracts and concats)
+/// moved to the top, or `value` if there is none: a mux of the slices of the
+/// register is the register.
+static Value hoistMux(ImplicitLocOpBuilder &b, Value value) {
+  auto *op = value.getDefiningOp();
+  if (!op)
+    return value;
+  if (auto cast = dyn_cast<hw::BitcastOp>(op)) {
+    auto mux = hoistMux(b, cast.getInput()).getDefiningOp<comb::MuxOp>();
+    if (!mux)
+      return value;
+    return comb::MuxOp::create(
+        b, mux.getCond(), castBits(b, mux.getTrueValue(), value.getType()),
+        castBits(b, mux.getFalseValue(), value.getType()));
+  }
+  if (auto extract = dyn_cast<comb::ExtractOp>(op)) {
+    auto mux = hoistMux(b, extract.getInput()).getDefiningOp<comb::MuxOp>();
+    if (!mux)
+      return value;
+    unsigned low = extract.getLowBit(),
+             width = hw::getBitWidth(extract.getType());
+    return comb::MuxOp::create(b, mux.getCond(),
+                               sliceBits(b, mux.getTrueValue(), low, width),
+                               sliceBits(b, mux.getFalseValue(), low, width));
+  }
+  if (auto concat = dyn_cast<comb::ConcatOp>(op)) {
+    SmallVector<Value> pieces;
+    Value cond;
+    for (auto operand : concat.getInputs()) {
+      pieces.push_back(hoistMux(b, operand));
+      if (auto mux = pieces.back().getDefiningOp<comb::MuxOp>(); mux && !cond)
+        cond = mux.getCond();
+    }
+    if (!cond)
+      return value;
+    // The pieces under another condition are the same on both sides.
+    SmallVector<Value> onTrue, onFalse;
+    for (auto piece : pieces) {
+      auto mux = piece.getDefiningOp<comb::MuxOp>();
+      bool split = mux && mux.getCond() == cond;
+      onTrue.push_back(split ? mux.getTrueValue() : piece);
+      onFalse.push_back(split ? mux.getFalseValue() : piece);
+    }
+    return comb::MuxOp::create(b, cond, joinBits(b, onTrue),
+                               joinBits(b, onFalse));
+  }
+  return value;
+}
+
 Threader::Write Threader::peelHolds(ImplicitLocOpBuilder &b, Value next,
                                     Value reg) {
+  if (next == reg)
+    return {/*holds=*/true, {}, {}};
+  next = hoistMux(b, next);
   if (next == reg)
     return {/*holds=*/true, {}, {}};
   auto mux = next.getDefiningOp<comb::MuxOp>();
@@ -588,6 +695,9 @@ LogicalResult Threader::run() {
     if (reg.getReset())
       next = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(), next);
     auto write = peelHolds(b, next, reg.getResult());
+    // Written every cycle: the next value as it is.
+    if (!write.holds && !write.enable)
+      write.data = next;
     Value memory;
     auto value = createThreadState(b, reg.getName(), reg.getType(), memory);
     reg.getResult().replaceAllUsesWith(value);
