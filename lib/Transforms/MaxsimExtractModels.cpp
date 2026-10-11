@@ -22,6 +22,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 
 namespace circt {
@@ -79,14 +80,44 @@ static unsigned getElementWidth(Type arrayType) {
 }
 
 bool BitTracer::isWiring(Operation *op) {
-  if (isa<hw::ConstantOp, comb::ConcatOp, comb::ExtractOp, hw::BitcastOp,
-          hw::ArrayCreateOp, hw::ArrayConcatOp>(op))
+  if (isa<hw::ConstantOp, hw::AggregateConstantOp, comb::ConcatOp,
+          comb::ExtractOp, hw::BitcastOp, hw::ArrayCreateOp, hw::ArrayConcatOp,
+          hw::StructCreateOp, hw::StructExtractOp>(op))
     return true;
   if (auto get = dyn_cast<hw::ArrayGetOp>(op))
     return matchPattern(get.getIndex(), m_Constant());
   if (auto slice = dyn_cast<hw::ArraySliceOp>(op))
     return matchPattern(slice.getLowIndex(), m_Constant());
   return false;
+}
+
+/// The bits of an aggregate constant: the first element of an array or field
+/// of a struct is in the high bits.
+static std::optional<APInt> getAggregateValue(Attribute attr, Type type) {
+  auto width = hw::getBitWidth(type);
+  if (width < 0)
+    return std::nullopt;
+  if (auto integer = dyn_cast<IntegerAttr>(attr))
+    return integer.getValue().zextOrTrunc(width);
+  auto elements = dyn_cast<ArrayAttr>(attr);
+  if (!elements)
+    return std::nullopt;
+  SmallVector<Type> types;
+  if (auto array = hw::type_dyn_cast<hw::ArrayType>(type))
+    types.assign(array.getNumElements(), array.getElementType());
+  else if (auto structType = hw::type_dyn_cast<hw::StructType>(type))
+    for (auto &field : structType.getElements())
+      types.push_back(field.type);
+  if (types.size() != elements.size())
+    return std::nullopt;
+  std::optional<APInt> result;
+  for (auto [element, elementType] : llvm::zip(elements, types)) {
+    auto value = getAggregateValue(element, elementType);
+    if (!value)
+      return std::nullopt;
+    result = result ? result->concat(*value) : *value;
+  }
+  return result;
 }
 
 const BitSources &BitTracer::get(Value value) {
@@ -137,6 +168,16 @@ BitSources BitTracer::compute(Value value) {
     }
     return sources;
   }
+  if (auto constant = dyn_cast<hw::AggregateConstantOp>(op)) {
+    auto value = getAggregateValue(constant.getFields(), constant.getType());
+    if (!value)
+      return sources;
+    for (auto [bit, source] : llvm::enumerate(sources)) {
+      source.kind = BitSource::Constant;
+      source.value = (*value)[bit];
+    }
+    return sources;
+  }
   if (auto concat = dyn_cast<comb::ConcatOp>(op))
     return appendReversed(concat.getInputs());
   if (auto extract = dyn_cast<comb::ExtractOp>(op))
@@ -149,6 +190,17 @@ BitSources BitTracer::compute(Value value) {
     return appendReversed(create.getInputs());
   if (auto concat = dyn_cast<hw::ArrayConcatOp>(op))
     return appendReversed(concat.getInputs());
+  // A struct's first field is in the high bits.
+  if (auto create = dyn_cast<hw::StructCreateOp>(op))
+    return appendReversed(create.getInput());
+  if (auto extract = dyn_cast<hw::StructExtractOp>(op)) {
+    auto elements = hw::type_cast<hw::StructType>(extract.getInput().getType())
+                        .getElements();
+    unsigned low = 0;
+    for (auto &element : elements.drop_front(extract.getFieldIndex() + 1))
+      low += hw::getBitWidth(element.type);
+    return slice(extract.getInput(), low);
+  }
   APInt index;
   if (auto get = dyn_cast<hw::ArrayGetOp>(op);
       get && matchPattern(get.getIndex(), m_ConstantInt(&index)))
@@ -224,6 +276,18 @@ void MaxsimExtractModelsPass::runOnOperation() {
   llvm::StringSet<> modelNames;
   for (auto &name : models)
     modelNames.insert(name);
+  llvm::StringMap<SmallVector<std::pair<unsigned, unsigned>>> givenInputs;
+  for (auto &entry : inputBits) {
+    SmallVector<StringRef, 3> fields;
+    StringRef(entry).split(fields, ':');
+    unsigned hi, lo;
+    if (fields.size() != 3 || fields[1].getAsInteger(10, hi) ||
+        fields[2].getAsInteger(10, lo) || hi < lo) {
+      parent.emitError("input bits '") << entry << "' are not <port>:<hi>:<lo>";
+      return signalPassFailure();
+    }
+    givenInputs[fields[0]].push_back({hi, lo});
+  }
 
   auto *body = parent.getBodyBlock();
   SmallVector<hw::InstanceOp> instances;
@@ -308,18 +372,57 @@ void MaxsimExtractModelsPass::runOnOperation() {
       auto isConstant = [&](unsigned bit) {
         return bits && (*bits)[bit].kind == BitSource::Constant;
       };
+      auto portBase = base + "_" + cast<StringAttr>(name).getValue().str();
+      auto constantPart = [&](unsigned lo, unsigned hi) {
+        APInt value(hi - lo + 1, 0);
+        for (unsigned bit = lo; bit <= hi; ++bit)
+          value.setBitVal(bit - lo, (*bits)[bit].value);
+        parts.push_back(hw::ConstantOp::create(builder, value));
+      };
+      if (auto it = givenInputs.find(portBase); it != givenInputs.end()) {
+        // The inputs are given; the bits they leave out must be constants.
+        auto ranges = it->second;
+        llvm::sort(ranges, [](auto a, auto b) { return a.second < b.second; });
+        for (auto [hi, lo2] : ranges) {
+          if (lo2 < lo || hi >= unsigned(width)) {
+            instance.emitError("input bits of '")
+                << portBase << "' overlap or exceed it";
+            return signalPassFailure();
+          }
+          for (unsigned bit = lo; bit < lo2; ++bit)
+            if (!isConstant(bit)) {
+              instance.emitError("bit ")
+                  << bit << " of '" << portBase
+                  << "' is not a constant and is not in an input";
+              return signalPassFailure();
+            }
+          if (lo2 > lo)
+            constantPart(lo, lo2 - 1);
+          parts.push_back(parent
+                              .appendInput(sliceName(portBase, hi, lo2, width),
+                                           builder.getIntegerType(hi - lo2 + 1))
+                              .second);
+          lo = hi + 1;
+        }
+        for (unsigned bit = lo; bit < unsigned(width); ++bit)
+          if (!isConstant(bit)) {
+            instance.emitError("bit ")
+                << bit << " of '" << portBase
+                << "' is not a constant and is not in an input";
+            return signalPassFailure();
+          }
+        if (lo < unsigned(width))
+          constantPart(lo, width - 1);
+        lo = width;
+      }
       while (lo < unsigned(width)) {
         unsigned hi = lo;
         while (hi + 1 < unsigned(width) && isConstant(hi + 1) == isConstant(lo))
           ++hi;
         if (isConstant(lo)) {
-          APInt value(hi - lo + 1, 0);
-          for (unsigned bit = lo; bit <= hi; ++bit)
-            value.setBitVal(bit - lo, (*bits)[bit].value);
-          parts.push_back(hw::ConstantOp::create(builder, value));
+          constantPart(lo, hi);
         } else {
-          auto portName = sliceName(
-              base + "_" + cast<StringAttr>(name).getValue(), hi, lo, width);
+          auto portName = sliceName(portBase, hi, lo, width);
           parts.push_back(
               parent.appendInput(portName, builder.getIntegerType(hi - lo + 1))
                   .second);

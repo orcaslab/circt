@@ -35,3 +35,41 @@ hw.module @Parent(in %clk : !seq.clock, in %reset : i1, in %x : i8, out z : i8, 
   %w = comb.xor %a.code, %c.code : i4
   hw.output %b.y, %w : i8, i4
 }
+
+// RUN: circt-opt %s --maxsim-extract-models="module=StructParent models=StructChild" | FileCheck %s --check-prefix=STRUCT
+
+// A constant field of a struct is a constant bit too: only `v` is a port.
+// STRUCT-LABEL: hw.module @StructParent(
+// STRUCT-SAME:    in %c_o_3_0_ : i4,
+// STRUCT-SAME:    out q : i8)
+hw.module @StructChild(in %clk : !seq.clock, in %a : i4, out o : i8) {
+  %c5_i4 = hw.constant 5 : i4
+  %s = hw.struct_create (%c5_i4, %a) : !hw.struct<k: i4, v: i4>
+  %b = hw.bitcast %s : (!hw.struct<k: i4, v: i4>) -> i8
+  hw.output %b : i8
+}
+hw.module @StructParent(in %clk : !seq.clock, in %x : i4, out q : i8) {
+  %c.o = hw.instance "c" @StructChild(clk: %clk: !seq.clock, a: %x: i4) -> (o: i8)
+  hw.output %c.o : i8
+}
+
+// RUN: circt-opt %s --maxsim-extract-models="module=AggParent models=AggChild input-bits=c_o:3:2,c_o:1:0" | FileCheck %s --check-prefix=AGG
+// RUN: not circt-opt %s --maxsim-extract-models="module=AggParent models=AggChild input-bits=c_o:1:0" 2>&1 | FileCheck %s --check-prefix=AGGERR
+
+// The inputs are given: the bits they leave out are an aggregate constant.
+// AGG-LABEL: hw.module @AggParent(
+// AGG-SAME:    in %c_o_1_0_ : i2, in %c_o_3_2_ : i2,
+// AGG:         [[O:%.+]] = comb.concat %c{{.*}}, %c_o_3_2_, %c_o_1_0_ : i4, i2, i2
+// AGG:         hw.output [[O]] : i8
+// The bits left out must be constants.
+// AGGERR: error: bit 2 of 'c_o' is not a constant and is not in an input
+hw.module @AggChild(in %clk : !seq.clock, in %a : i4, out o : i8) {
+  %k = hw.aggregate_constant [2 : i2, 1 : i2] : !hw.struct<x: i2, y: i2>
+  %s = hw.struct_create (%k, %a) : !hw.struct<k: !hw.struct<x: i2, y: i2>, v: i4>
+  %b = hw.bitcast %s : (!hw.struct<k: !hw.struct<x: i2, y: i2>, v: i4>) -> i8
+  hw.output %b : i8
+}
+hw.module @AggParent(in %clk : !seq.clock, in %x : i4, out q : i8) {
+  %c.o = hw.instance "c" @AggChild(clk: %clk: !seq.clock, a: %x: i4) -> (o: i8)
+  hw.output %c.o : i8
+}

@@ -284,6 +284,10 @@ def MaxsimExtractModels : Pass<"maxsim-extract-models", "::mlir::ModuleOp"> {
            "The parent to cut the models out of">,
     ListOption<"models", "models", "std::string",
                "The modules simulated as separate models">,
+    ListOption<"inputBits", "input-bits", "std::string",
+               "The inputs to take for the outputs of the models, as "
+               "<instance>_<port>:<hi>:<lo>, to match an existing interface; "
+               "the bits of such a port they leave out must be constants">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
