@@ -305,6 +305,51 @@ def MaxsimExtractModels : Pass<"maxsim-extract-models", "::mlir::ModuleOp"> {
   ];
 }
 
+def MaxsimCompose : Pass<"maxsim-compose", "::mlir::ModuleOp"> {
+  let summary = "Compose a simulator of threaded models from a netlist";
+  let description = [{
+    Builds the simulator of the netlist `module` (as `maxsim-extract-models`
+    with `netlist` leaves it): the netlists it instantiates are inlined, the
+    instances of each model are threaded into one module (`maxsim-fame5` with
+    `clock-enable` and `thread-index`), and every channel between them is
+    built in one fabric, in the module `sim`:
+
+    - `hostClock` and `hostReset`; for each input `x` of the netlist but its
+      clock, the channel `x_valid`, `x_ready`, `x_bits`, and for each output
+      `y`, `y_valid`, `y_ready`, `y_bits` (no bits port for no bits).
+    - Each output of a model, or input of the netlist, is a producer of
+      tokens: every thread of it has two slots, written in turn, and a count
+      of tokens written. A token is taken by each input it feeds, which counts
+      the tokens it has read from it; the producer is ready while every reader
+      has read all but at most one of them. This is the two-entry channel of
+      FireSim's LI-BDN simulators, with fan-out, so a model's outputs reach
+      their inputs on the next host cycle.
+    - An input reads its bits from the producers its netlist wiring gives,
+      for each thread; it is valid when all of them have a token for it. A
+      producer whose readers are all threaded inputs that read it for every
+      thread the same way keeps its slots in a memory, read at the reader's
+      thread; any other, in registers.
+    - An input of the netlist that is exactly one input of a model of one
+      instance, and an output of one that is exactly one of the netlist's
+      outputs, are connected directly: the shell around the simulator drives
+      and takes them, with valid and ready that depend on its state alone.
+  }];
+  let options = [
+    Option<"moduleName", "module", "std::string", "",
+           "The netlist to simulate">,
+    Option<"simName", "sim", "std::string", "\"maxsim_sim\"",
+           "The name of the simulator module">,
+    Option<"readySchedule", "ready-schedule", "bool", "true",
+           "Advance each model to a thread whose inputs are all there, "
+           "rather than to the next in turn">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect",
+    "circt::seq::SeqDialect"
+  ];
+}
+
 def MaxsimFAME5 : Pass<"maxsim-fame5", "::mlir::ModuleOp"> {
   let summary = "Thread a flat model's state for FireSim's FAME-5 simulation";
   let description = [{

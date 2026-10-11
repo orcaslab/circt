@@ -6,6 +6,7 @@ add_circt_library(CIRCTTransforms
   InsertMergeBlocks.cpp
   ConvertIndexToUInt.cpp
   MapArithToComb.cpp
+  MaxsimCompose.cpp
   MaxsimExtractModels.cpp
   MaxsimFAME5.cpp
   MaximizeSSA.cpp
