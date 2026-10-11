@@ -4,6 +4,8 @@
 // `clocks_0`, a channel always valid whose token enables the next edge.
 // CHECK-LABEL: hw.module @Hub_threaded_Hub(
 // CHECK-SAME:    out clocks_0_sink_ready : i1, in %clocks_0_sink_bits : i1,
+// No output fires eagerly: whether a finish makes an edge is in the clock token.
+// CHECK-SAME:    attributes {maxsim.eager_channels = []}
 // CHECK-NOT:     seq.firmem
 // CHECK-DAG:     %r = seq.firreg {{%.+}} clock %clk_buffer.O : i8
 // The enabled edge is the last clock token's.

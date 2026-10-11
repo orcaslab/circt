@@ -893,7 +893,10 @@ LogicalResult Threader::run() {
   // An output that depends on no input fires eagerly, with the next cycle's
   // value once its thread has finished.
   for (auto &channel : outputs) {
-    channel.eager = channel.deps.none() && !dependsOnMemory(channel.current);
+    // With a clock channel, whether a cycle's finish makes an edge, and so
+    // what the next value is, is only known from the clock token.
+    channel.eager = clockChannel.empty() && channel.deps.none() &&
+                    !dependsOnMemory(channel.current);
     if (channel.eager)
       channel.next = getNext(channel.current, b);
   }
