@@ -278,12 +278,22 @@ def MaxsimExtractModels : Pass<"maxsim-extract-models", "::mlir::ModuleOp"> {
       `<instance>_<port>_<bit>_` for one, when they are not all of them.
 
     Clock ports are left out, as models take their clock from the simulator.
+
+    With `netlist`, the parent's own logic becomes `<module>_model`, and
+    `<module>` becomes its netlist: a module of the parent's ports that only
+    instantiates `<module>_model` and the models, wired as the parent wired
+    them, with the `maxsim.netlist` attribute. Instances of the parent elsewhere
+    stay valid, so a netlist can be cut out of its own parent in turn. A model
+    output the parent's logic does not read then has no input on it, and a
+    model input only constants drive is connected to them.
   }];
   let options = [
     Option<"moduleName", "module", "std::string", "",
            "The parent to cut the models out of">,
     ListOption<"models", "models", "std::string",
                "The modules simulated as separate models">,
+    Option<"netlist", "netlist", "bool", "false",
+           "Keep the parent as a netlist of its logic and the models">,
     ListOption<"inputBits", "input-bits", "std::string",
                "The inputs to take for the outputs of the models, as "
                "<instance>_<port>:<hi>:<lo>, to match an existing interface; "

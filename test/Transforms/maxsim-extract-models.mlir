@@ -79,3 +79,22 @@ hw.module @AggParent(in %clk : !seq.clock, in %x : i4, out q : i8) {
   %c.o = hw.instance "c" @AggChild(clk: %clk: !seq.clock, a: %x: i4) -> (o: i8)
   hw.output %c.o : i8
 }
+
+// RUN: circt-opt %s --maxsim-extract-models="module=Parent models=Child netlist" | FileCheck %s --check-prefix=NET
+
+// As a netlist: the parent's logic is `Parent_model`, with no ports for tokens
+// only, and `Parent` instantiates it beside the children, wired as before.
+// NET-LABEL: hw.module private @Parent_model(
+// NET-SAME:    in %x : i8, in %a_code_3_ : i1, in %b_y : i8, in %c_code_3_ : i1,
+// NET-SAME:    out z : i8, out w : i4, out a_a : i8)
+// NET-NOT:   attributes
+// NET-LABEL: hw.module @Parent(in %clk : !seq.clock, in %reset : i1, in %x : i8, out z : i8, out w : i4)
+// NET-SAME:    attributes {maxsim.netlist}
+// NET:         %logic.z, %logic.w, %logic.a_a = hw.instance "logic" @Parent_model(clk: %clk: !seq.clock, reset: %reset: i1, x: %x: i8, a_code_3_: [[ACODE:%.+]]: i1, b_y: %b.y: i8, c_code_3_: [[CCODE:%.+]]: i1)
+// NET:         %a.y, %a.code = hw.instance "a" @Child(clk: %clk: !seq.clock, reset: {{%.+}}: i1, id: [[ID1:%.+]]: i2, a: %logic.a_a: i8, unread: {{%.+}}: i8)
+// NET:         %b.y, %b.code = hw.instance "b" @Child(clk: %clk: !seq.clock, reset: {{%.+}}: i1, id: {{%.+}}: i2, a: %a.y: i8,
+// NET:         %c.y, %c.code = hw.instance "c" @Child(clk: %clk: !seq.clock, reset: {{%.+}}: i1, id: {{%.+}}: i2, a: %x: i8,
+// NET-DAG:     [[ACODE]] = comb.extract %a.code from 3 : (i4) -> i1
+// NET-DAG:     [[CCODE]] = comb.extract %c.code from 3 : (i4) -> i1
+// NET-DAG:     [[ID1]] = hw.constant 1 : i2
+// NET:         hw.output %logic.z, %logic.w : i8, i4

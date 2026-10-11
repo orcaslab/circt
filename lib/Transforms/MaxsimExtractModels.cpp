@@ -16,6 +16,7 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "circt/Support/BackedgeBuilder.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Matchers.h"
@@ -356,6 +357,8 @@ void MaxsimExtractModelsPass::runOnOperation() {
   }
 
   auto *body = parent.getBodyBlock();
+  auto originalPorts = parent.getPortList();
+  auto numOutputs = parent.getNumOutputPorts();
   SmallVector<hw::InstanceOp> instances;
   DenseSet<Value> ports(body->args_begin(), body->args_end());
   DenseMap<StringAttr, SmallVector<BitSources>> constantOutputs;
@@ -392,6 +395,13 @@ void MaxsimExtractModelsPass::runOnOperation() {
       portNames[result] = sanitize(instance.getInstanceName()) + "_" +
                           cast<StringAttr>(name).getValue().str();
   SmallVector<Attribute> directInputs;
+  // For the netlist: how each model input is connected, by instance and input.
+  // A channel is a new output of the parent; a direct input, its bits.
+  struct InputPlan {
+    std::optional<unsigned> output;
+    std::optional<BitSources> bits;
+  };
+  DenseMap<std::pair<unsigned, unsigned>, InputPlan> inputPlans;
   auto hasConstantBits = [&](Value output) {
     auto result = cast<OpResult>(output);
     auto instance = cast<hw::InstanceOp>(result.getOwner());
@@ -402,7 +412,7 @@ void MaxsimExtractModelsPass::runOnOperation() {
              return bit.kind == BitSource::Constant;
            });
   };
-  for (auto instance : instances) {
+  for (auto [instanceIndex, instance] : llvm::enumerate(instances)) {
     auto base = sanitize(instance.getInstanceName());
     auto model = dyn_cast_or_null<hw::HWModuleOp>(SymbolTable::lookupSymbolIn(
         top, instance.getModuleNameAttr().getAttr()));
@@ -436,12 +446,17 @@ void MaxsimExtractModelsPass::runOnOperation() {
                  });
       }
       auto portName = base + "_" + cast<StringAttr>(name).getValue().str();
+      if (direct && netlist) {
+        inputPlans[{instanceIndex, index}].bits = sources;
+        continue;
+      }
       if (direct && !llvm::all_of(sources, isConstant)) {
         directInputs.push_back(builder.getStringAttr(
             portName + " = " +
             describe(sources, [&](Value port) { return portNames[port]; })));
         continue;
       }
+      inputPlans[{instanceIndex, index}].output = newOutputs.size();
       Value value = operand;
       if (direct)
         value = hw::ConstantOp::create(builder, builder.getIntegerType(0), 0);
@@ -464,6 +479,17 @@ void MaxsimExtractModelsPass::runOnOperation() {
   for (auto instance : instances)
     modelOps.insert(instance);
   DenseMap<Value, bool> readByParent;
+  // For the netlist: the model output bits each new input of the parent takes.
+  struct InputSource {
+    Value result;
+    unsigned low, width;
+  };
+  SmallVector<InputSource> newInputs;
+  auto appendInput = [&](Value result, StringRef portName, unsigned low,
+                         unsigned width) {
+    newInputs.push_back({result, low, width});
+    return parent.appendInput(portName, builder.getIntegerType(width)).second;
+  };
   for (auto instance : instances) {
     auto base = sanitize(instance.getInstanceName());
     auto constants =
@@ -499,7 +525,8 @@ void MaxsimExtractModelsPass::runOnOperation() {
                          });
       if (givenIt == givenInputs.end() && !allConstant &&
           !isReadByParent(result, modelOps, readByParent)) {
-        parent.appendInput(portBase, builder.getIntegerType(0));
+        if (!netlist)
+          parent.appendInput(portBase, builder.getIntegerType(0));
         if (!result.use_empty()) {
           Value zero = hw::ConstantOp::create(builder, APInt::getZero(width));
           if (zero.getType() != result.getType())
@@ -527,10 +554,8 @@ void MaxsimExtractModelsPass::runOnOperation() {
             }
           if (lo2 > lo)
             constantPart(lo, lo2 - 1);
-          parts.push_back(parent
-                              .appendInput(sliceName(portBase, hi, lo2, width),
-                                           builder.getIntegerType(hi - lo2 + 1))
-                              .second);
+          parts.push_back(appendInput(
+              result, sliceName(portBase, hi, lo2, width), lo2, hi - lo2 + 1));
           lo = hi + 1;
         }
         for (unsigned bit = lo; bit < unsigned(width); ++bit)
@@ -551,10 +576,8 @@ void MaxsimExtractModelsPass::runOnOperation() {
         if (isConstant(lo)) {
           constantPart(lo, hi);
         } else {
-          auto portName = sliceName(portBase, hi, lo, width);
-          parts.push_back(
-              parent.appendInput(portName, builder.getIntegerType(hi - lo + 1))
-                  .second);
+          parts.push_back(appendInput(
+              result, sliceName(portBase, hi, lo, width), lo, hi - lo + 1));
         }
         lo = hi + 1;
       }
@@ -566,6 +589,131 @@ void MaxsimExtractModelsPass::runOnOperation() {
         value = hw::BitcastOp::create(builder, result.getType(), value);
       result.replaceAllUsesWith(value);
     }
+  }
+  if (netlist) {
+    // The parent's logic is a model of its own, and the parent its netlist.
+    auto name = parent.getSymNameAttr();
+    parent.setSymName((name.getValue() + "_model").str());
+    OpBuilder outer(parent);
+    outer.setInsertionPointAfter(parent);
+    auto net = hw::HWModuleOp::create(outer, parent.getLoc(), name,
+                                      hw::ModulePortInfo(originalPorts));
+    net.setVisibility(parent.getVisibility());
+    parent.setPrivate();
+    net->setAttr("maxsim.netlist", outer.getUnitAttr());
+    auto *netBody = net.getBodyBlock();
+    netBody->getTerminator()->erase();
+    auto b = ImplicitLocOpBuilder::atBlockEnd(parent.getLoc(), netBody);
+    BackedgeBuilder backedges(b, parent.getLoc());
+
+    // The instances, their inputs to be connected.
+    DenseMap<Value, Value> netValues;
+    for (auto [index, arg] : llvm::enumerate(netBody->getArguments()))
+      netValues[body->getArgument(index)] = arg;
+    SmallVector<Backedge> logicInputs;
+    SmallVector<Value> operands(netBody->getArguments().begin(),
+                                netBody->getArguments().end());
+    for (auto source : newInputs) {
+      logicInputs.push_back(backedges.get(b.getIntegerType(source.width)));
+      operands.push_back(logicInputs.back());
+    }
+    auto logic = hw::InstanceOp::create(b, parent, "logic", operands);
+    SmallVector<SmallVector<Backedge>> modelInputs;
+    SmallVector<hw::InstanceOp> netInstances;
+    for (auto instance : instances) {
+      auto &inputs = modelInputs.emplace_back();
+      SmallVector<Value> instanceOperands;
+      for (auto operand : instance.getInputs()) {
+        inputs.push_back(backedges.get(operand.getType()));
+        instanceOperands.push_back(inputs.back());
+      }
+      auto netInstance = hw::InstanceOp::create(
+          b,
+          SymbolTable::lookupSymbolIn(top,
+                                      instance.getModuleNameAttr().getAttr()),
+          instance.getInstanceNameAttr(), instanceOperands,
+          instance.getParametersAttr(), instance.getInnerSymAttr());
+      netInstances.push_back(netInstance);
+      for (auto [result, netResult] :
+           llvm::zip(instance.getResults(), netInstance.getResults()))
+        netValues[result] = netResult;
+    }
+
+    // `width` bits of `value` from `low`, as an integer.
+    auto bitsOf = [&](Value value, unsigned low, unsigned width) -> Value {
+      auto valueWidth = hw::getBitWidth(value.getType());
+      if (!value.getType().isInteger(valueWidth))
+        value =
+            b.createOrFold<hw::BitcastOp>(b.getIntegerType(valueWidth), value);
+      return b.createOrFold<comb::ExtractOp>(b.getIntegerType(width), value,
+                                             low);
+    };
+    auto castTo = [&](Value value, Type type) -> Value {
+      return value.getType() == type
+                 ? value
+                 : b.createOrFold<hw::BitcastOp>(type, value);
+    };
+    for (auto [backedge, source] : llvm::zip(logicInputs, newInputs))
+      backedge.setValue(
+          bitsOf(netValues[source.result], source.low, source.width));
+    for (auto [instanceIndex, instance] : llvm::enumerate(instances)) {
+      for (auto [index, operand] : llvm::enumerate(instance.getInputs())) {
+        auto type = operand.getType();
+        Value value;
+        auto plan = inputPlans.find({instanceIndex, index});
+        if (plan != inputPlans.end() && plan->second.output) {
+          value =
+              castTo(logic.getResult(numOutputs + *plan->second.output), type);
+        } else if (plan != inputPlans.end() && plan->second.bits) {
+          // The bits, from the most significant, in runs of one source.
+          auto &bits = *plan->second.bits;
+          SmallVector<Value> parts;
+          for (unsigned hi = bits.size(); hi > 0;) {
+            auto &first = bits[hi - 1];
+            unsigned lo = hi - 1;
+            while (lo > 0) {
+              auto &next = bits[lo - 1];
+              bool same = first.kind == BitSource::Constant
+                              ? next.kind == BitSource::Constant
+                              : next.kind == BitSource::Port &&
+                                    next.port == first.port &&
+                                    next.bit + (hi - lo) == first.bit;
+              if (!same)
+                break;
+              --lo;
+            }
+            if (first.kind == BitSource::Constant) {
+              APInt constant(hi - lo, 0);
+              for (unsigned bit = lo; bit < hi; ++bit)
+                constant.setBitVal(bit - lo, bits[bit].value);
+              parts.push_back(hw::ConstantOp::create(b, constant));
+            } else {
+              parts.push_back(bitsOf(netValues[first.port],
+                                     first.bit - (hi - 1 - lo), hi - lo));
+            }
+            hi = lo;
+          }
+          value =
+              castTo(parts.size() == 1 ? parts[0]
+                                       : b.createOrFold<comb::ConcatOp>(parts),
+                     type);
+        } else if (isa<seq::ClockType>(type)) {
+          value = netValues.lookup(operand);
+          if (!value) {
+            instance.emitError("clock of a model not from a parent input");
+            return signalPassFailure();
+          }
+        } else {
+          // Not a channel: an input the model does not read.
+          auto width = std::max<int64_t>(hw::getBitWidth(type), 0);
+          value =
+              castTo(hw::ConstantOp::create(b, APInt::getZero(width)), type);
+        }
+        modelInputs[instanceIndex][index].setValue(value);
+      }
+    }
+    hw::OutputOp::create(b,
+                         ValueRange(logic.getResults().take_front(numOutputs)));
   }
   for (auto instance : instances)
     instance.erase();
