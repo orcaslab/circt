@@ -23,6 +23,8 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include <map>
+#include <numeric>
 
 namespace circt {
 #define GEN_PASS_DEF_MAXSIMFAME5
@@ -45,6 +47,14 @@ using BitDeps = SmallVector<llvm::BitVector>;
 /// A target port of the model and the channel it becomes.
 struct Channel {
   StringAttr name;
+  /// A channel of several ports carries them as fields, the first one in the
+  /// high bits of its type, each on a bits port `<name>_{sink,source}_<field>`.
+  struct Field {
+    StringAttr name;
+    unsigned argNum;
+    Type type;
+  };
+  SmallVector<Field> fields;
   Type type;
   /// For an input, its block argument in the model; for an output, its index.
   unsigned argNum = 0;
@@ -63,12 +73,15 @@ struct Channel {
 class Threader {
 public:
   using Slices = llvm::StringMap<SmallVector<std::pair<unsigned, unsigned>>>;
+  /// The ports that are fields of a channel: port -> (channel, field, rank).
+  using Fields =
+      llvm::StringMap<std::tuple<std::string, std::string, unsigned>>;
 
   Threader(hw::HWModuleOp model, unsigned threads, StringAttr name,
            hw::HWModuleExternOp gate, const Slices &slices,
-           StringRef clockChannel)
+           const Fields &fields, StringRef clockChannel)
       : model(model), threads(threads), name(name), gate(gate), slices(slices),
-        clockChannel(clockChannel) {}
+        fields(fields), clockChannel(clockChannel) {}
 
   LogicalResult run();
 
@@ -99,6 +112,7 @@ private:
   StringAttr name;
   hw::HWModuleExternOp gate;
   const Slices &slices;
+  const Fields &fields;
   /// The channel the target clock comes in on, if any.
   StringRef clockChannel;
   /// A single thread's state: the registers not written yet, with their next
@@ -116,6 +130,9 @@ private:
   bool dependsOnMemory(Value value);
   /// For each bit of an input port, the channel carrying it.
   DenseMap<Value, SmallVector<unsigned>> inputOfArg;
+  /// The channels of fields, by name, as their index plus one.
+  llvm::StringMap<unsigned> inputBundles, outputBundles;
+  std::map<std::pair<unsigned, bool>, SmallVector<unsigned>> fieldRanks;
   DenseMap<Value, std::unique_ptr<BitDeps>> deps;
   DenseMap<Value, Value> nexts;
   DenseMap<Value, bool> stateDeps;
@@ -196,6 +213,25 @@ LogicalResult Threader::checkModel() {
     auto width = hw::getBitWidth(port.type);
     if (width < 0)
       return model.emitError("port '") << port.name << "' has no bit width";
+    if (auto field = fields.find(port.name.getValue()); field != fields.end()) {
+      auto &[channelName, fieldName, rank] = field->second;
+      auto &channels = isInput ? inputs : outputs;
+      auto &index = (isInput ? inputBundles : outputBundles)[channelName];
+      if (!index) {
+        Channel channel;
+        channel.name = StringAttr::get(model.getContext(), channelName);
+        channels.push_back(channel);
+        index = channels.size();
+      }
+      channels[index - 1].fields.push_back(
+          {StringAttr::get(model.getContext(), fieldName),
+           unsigned(port.argNum), port.type});
+      fieldRanks[{index - 1, isInput}].push_back(rank);
+      if (isInput)
+        inputOfArg[body->getArgument(port.argNum)] =
+            SmallVector<unsigned>(width, index - 1);
+      continue;
+    }
     if (isInput && width > 0 && body->getArgument(port.argNum).use_empty())
       continue;
     // An output that is an input, wired through, is not a channel of the
@@ -251,6 +287,26 @@ LogicalResult Threader::checkModel() {
     }
     if (isInput)
       inputOfArg[body->getArgument(port.argNum)] = bitChannels;
+  }
+  // A channel's fields in the order given, its type their bits together.
+  for (auto isInput : {true, false}) {
+    auto &channels = isInput ? inputs : outputs;
+    for (auto [index, channel] : llvm::enumerate(channels)) {
+      if (channel.fields.empty())
+        continue;
+      auto &ranks = fieldRanks[{index, isInput}];
+      SmallVector<unsigned> order(ranks.size());
+      std::iota(order.begin(), order.end(), 0);
+      llvm::sort(order, [&](auto a, auto b) { return ranks[a] < ranks[b]; });
+      SmallVector<Channel::Field> sorted;
+      unsigned width = 0;
+      for (auto i : order) {
+        sorted.push_back(channel.fields[i]);
+        width += hw::getBitWidth(channel.fields[i].type);
+      }
+      channel.fields = sorted;
+      channel.type = IntegerType::get(model.getContext(), width);
+    }
   }
   if (!hasClock)
     return model.emitError("a model has a clock input");
@@ -416,7 +472,21 @@ const BitDeps &Threader::getDeps(Value value) {
 
 void Threader::computeDeps() {
   auto output = cast<hw::OutputOp>(model.getBodyBlock()->getTerminator());
+  ImplicitLocOpBuilder b(model.getLoc(), output);
   for (auto &channel : outputs) {
+    if (!channel.fields.empty()) {
+      // The fields' bits together, the first one high.
+      SmallVector<Value> parts;
+      for (auto &field : channel.fields)
+        parts.push_back(b.createOrFold<hw::BitcastOp>(
+            b.getIntegerType(hw::getBitWidth(field.type)),
+            output.getOperand(field.argNum)));
+      channel.current = b.createOrFold<comb::ConcatOp>(parts);
+      channel.deps = llvm::BitVector(inputs.size());
+      for (auto &bit : getDeps(channel.current))
+        channel.deps |= bit;
+      continue;
+    }
     auto value = output.getOperand(channel.argNum);
     channel.current = value;
     channel.deps = llvm::BitVector(inputs.size());
@@ -701,19 +771,28 @@ LogicalResult Threader::run() {
     addPort(clockChannel + "_sink_ready", i1, false);
     addPort(clockChannel + "_sink_bits", i1, true);
   }
+  // The bits ports of a channel: one, or one per field.
+  auto addBits = [&](Channel &channel, StringRef dir, bool isInput) {
+    if (channel.fields.empty()) {
+      if (hw::getBitWidth(channel.type) > 0)
+        addPort(channel.name.getValue() + "_" + dir + "_bits",
+                IntegerType::get(context, hw::getBitWidth(channel.type)),
+                isInput);
+      return;
+    }
+    for (auto &field : channel.fields)
+      addPort(channel.name.getValue() + "_" + dir + "_" + field.name.getValue(),
+              IntegerType::get(context, hw::getBitWidth(field.type)), isInput);
+  };
   for (auto &channel : inputs) {
     addPort(channel.name.getValue() + "_sink_ready", i1, false);
     addPort(channel.name.getValue() + "_sink_valid", i1, true);
-    if (hw::getBitWidth(channel.type) > 0)
-      addPort(channel.name.getValue() + "_sink_bits",
-              IntegerType::get(context, hw::getBitWidth(channel.type)), true);
+    addBits(channel, "sink", true);
   }
   for (auto &channel : outputs) {
     addPort(channel.name.getValue() + "_source_ready", i1, true);
     addPort(channel.name.getValue() + "_source_valid", i1, false);
-    if (hw::getBitWidth(channel.type) > 0)
-      addPort(channel.name.getValue() + "_source_bits",
-              IntegerType::get(context, hw::getBitWidth(channel.type)), false);
+    addBits(channel, "source", false);
   }
 
   OpBuilder top(model);
@@ -731,6 +810,13 @@ LogicalResult Threader::run() {
   ImplicitLocOpBuilder top0(model.getLoc(), body, body->begin());
   for (auto &channel : inputs) {
     sinkValid.push_back(body->getArgument(arg++));
+    if (!channel.fields.empty()) {
+      SmallVector<Value> parts;
+      for (unsigned i = 0; i < channel.fields.size(); ++i)
+        parts.push_back(body->getArgument(arg++));
+      sinkBits.push_back(top0.createOrFold<comb::ConcatOp>(parts));
+      continue;
+    }
     sinkBits.push_back(
         hw::getBitWidth(channel.type) > 0
             ? Value(body->getArgument(arg++))
@@ -755,6 +841,21 @@ LogicalResult Threader::run() {
   DenseMap<Value, Value> replaced;
   // An input split into channels is their bits put back together.
   for (auto [i, channel] : llvm::enumerate(inputs)) {
+    if (!channel.fields.empty()) {
+      // Each field's bits, the first one high.
+      unsigned high = hw::getBitWidth(channel.type);
+      for (auto &field : channel.fields) {
+        auto arg = modelBody->getArgument(field.argNum);
+        auto width = hw::getBitWidth(field.type);
+        high -= width;
+        Value value = b.createOrFold<comb::ExtractOp>(b.getIntegerType(width),
+                                                      sinkBits[i], high);
+        value = b.createOrFold<hw::BitcastOp>(arg.getType(), value);
+        arg.replaceAllUsesWith(value);
+        replaced[arg] = value;
+      }
+      continue;
+    }
     auto arg = modelBody->getArgument(channel.argNum);
     if (replaced.count(arg))
       continue;
@@ -1041,8 +1142,19 @@ LogicalResult Threader::run() {
                      ? Value(comb::MuxOp::create(b, outFired[i], channel.next,
                                                  channel.current))
                      : channel.current;
-    results.push_back(b.createOrFold<hw::BitcastOp>(
-        b.getIntegerType(hw::getBitWidth(channel.type)), bits));
+    bits = b.createOrFold<hw::BitcastOp>(
+        b.getIntegerType(hw::getBitWidth(channel.type)), bits);
+    if (channel.fields.empty()) {
+      results.push_back(bits);
+      continue;
+    }
+    unsigned high = hw::getBitWidth(channel.type);
+    for (auto &field : channel.fields) {
+      auto width = hw::getBitWidth(field.type);
+      high -= width;
+      results.push_back(
+          b.createOrFold<comb::ExtractOp>(b.getIntegerType(width), bits, high));
+    }
   }
   hw::OutputOp::create(b, results);
 
@@ -1121,6 +1233,19 @@ void MaxsimFAME5Pass::runOnOperation() {
     }
     slices[fields[0]].push_back({hi, lo});
   }
-  if (failed(Threader(model, threads, name, gate, slices, clockChannel).run()))
+  Threader::Fields channelFields;
+  for (auto [rank, entry] : llvm::enumerate(this->channelFields)) {
+    auto [channelField, port] = StringRef(entry).split('=');
+    auto [channel, field] = channelField.split('.');
+    if (port.empty() || field.empty()) {
+      model.emitError("channel field '")
+          << entry << "' is not <channel>.<field>=<port>";
+      return signalPassFailure();
+    }
+    channelFields[port] = {channel.str(), field.str(), unsigned(rank)};
+  }
+  if (failed(Threader(model, threads, name, gate, slices, channelFields,
+                      clockChannel)
+                 .run()))
     return signalPassFailure();
 }

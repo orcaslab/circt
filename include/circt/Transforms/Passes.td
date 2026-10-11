@@ -332,6 +332,10 @@ def MaxsimFAME5 : Pass<"maxsim-fame5", "::mlir::ModuleOp"> {
                "Ports split into channels of some of their bits, as "
                "<port>:<hi>:<lo>; a channel is named <port>_<hi>_<lo>_, or "
                "<port>_<hi>_ for one bit">,
+    ListOption<"channelFields", "channel-fields", "std::string",
+               "Ports carried together as the fields of one channel, as "
+               "<channel>.<field>=<port>, first field first; each field has "
+               "its bits port <channel>_{sink,source}_<field>">,
     Option<"clockChannel", "clock-channel", "std::string", "",
            "For a model of one instance: the channel its target clock comes "
            "in on, whose tokens say whether each cycle's edge is enabled">,
