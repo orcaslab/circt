@@ -45,8 +45,56 @@ struct MaxsimFAME5Pass : public circt::impl::MaxsimFAME5Base<MaxsimFAME5Pass> {
   void runOnOperation() override;
 };
 
-/// The inputs each bit of a value depends on.
-using BitDeps = SmallVector<llvm::BitVector>;
+/// Sets of inputs, each stored once: a model's bits depend on few distinct
+/// sets, and a set per bit of every value does not fit in memory for a large
+/// model. Set 0 is the empty set.
+class DepSets {
+public:
+  explicit DepSets(unsigned numInputs) : numInputs(numInputs) {
+    intern(llvm::BitVector(numInputs));
+  }
+  /// The set of only `input`.
+  unsigned single(unsigned input) {
+    llvm::BitVector set(numInputs);
+    set.set(input);
+    return intern(std::move(set));
+  }
+  /// The union of two sets.
+  unsigned unite(unsigned a, unsigned b) {
+    if (a == b || b == 0)
+      return a;
+    if (a == 0)
+      return b;
+    auto key = std::make_pair(std::min(a, b), std::max(a, b));
+    if (auto it = unions.find(key); it != unions.end())
+      return it->second;
+    llvm::BitVector set = sets[a];
+    set |= sets[b];
+    return unions[key] = intern(std::move(set));
+  }
+  const llvm::BitVector &get(unsigned id) const { return sets[id]; }
+
+private:
+  unsigned intern(llvm::BitVector set) {
+    auto words = set.getData();
+    auto hash = llvm::hash_combine_range(words.begin(), words.end());
+    auto &ids = byHash[hash];
+    for (auto id : ids)
+      if (sets[id] == set)
+        return id;
+    ids.push_back(sets.size());
+    sets.push_back(std::move(set));
+    return sets.size() - 1;
+  }
+
+  unsigned numInputs;
+  std::vector<llvm::BitVector> sets;
+  DenseMap<llvm::hash_code, SmallVector<unsigned, 1>> byHash;
+  DenseMap<std::pair<unsigned, unsigned>, unsigned> unions;
+};
+
+/// The inputs each bit of a value depends on, as sets of DepSets.
+using BitDeps = SmallVector<unsigned>;
 
 /// A target port of the model and the channel it becomes.
 struct Channel {
@@ -154,6 +202,11 @@ private:
   llvm::StringMap<unsigned> inputBundles, outputBundles;
   std::map<std::pair<unsigned, bool>, SmallVector<unsigned>> fieldRanks;
   DenseMap<Value, std::unique_ptr<BitDeps>> deps;
+  /// The union of a value's bits' sets.
+  DenseMap<Value, unsigned> allDeps;
+  /// Values whose sets are being computed: a cycle reads them unfinished.
+  DenseSet<Value> depsInProgress;
+  std::unique_ptr<DepSets> depSets;
   DenseMap<Value, Value> nexts;
   DenseMap<Value, bool> stateDeps;
   Value threadIdx, hostClock;
@@ -377,35 +430,43 @@ const BitDeps &Threader::getDeps(Value value) {
   if (auto it = deps.find(value); it != deps.end())
     return *it->second;
   auto width = std::max<int64_t>(hw::getBitWidth(value.getType()), 0);
-  auto result =
-      std::make_unique<BitDeps>(width, llvm::BitVector(inputs.size()));
+  if (!depSets)
+    depSets = std::make_unique<DepSets>(inputs.size());
+  auto &sets = *depSets;
+  auto result = std::make_unique<BitDeps>(width, 0);
   // Placeholder against combinational cycles.
   deps[value] = std::make_unique<BitDeps>(*result);
+  depsInProgress.insert(value);
   auto &bits = *result;
-  auto all = [&](Value operand) {
-    llvm::BitVector any(inputs.size());
-    for (auto &bit : getDeps(operand))
-      any |= bit;
-    return any;
+  auto all = [&](Value operand) -> unsigned {
+    if (auto it = allDeps.find(operand); it != allDeps.end())
+      return it->second;
+    unsigned any = 0;
+    auto operandBits = getDeps(operand);
+    for (auto bit : operandBits)
+      any = sets.unite(any, bit);
+    if (depsInProgress.contains(operand))
+      return any;
+    return allDeps[operand] = any;
   };
   auto copyBits = [&](Value operand, unsigned from, unsigned to,
                       unsigned count) {
     auto operandBits = getDeps(operand);
     for (unsigned i = 0; i < count; ++i)
-      bits[to + i] |= operandBits[from + i];
+      bits[to + i] = sets.unite(bits[to + i], operandBits[from + i]);
   };
   auto *op = value.getDefiningOp();
   APInt index;
   if (auto it = inputOfArg.find(value); it != inputOfArg.end()) {
     for (auto [bit, channel] : llvm::zip(bits, it->second))
-      bit.set(channel);
+      bit = sets.single(channel);
   } else if (auto read = dyn_cast_or_null<seq::FirMemReadOp>(op)) {
     // A registered read is state; a combinational one follows its address.
     auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
     if (!memory || memory.getReadLatency() == 0) {
-      llvm::BitVector any = all(read.getAddress());
+      unsigned any = all(read.getAddress());
       if (read.getEnable())
-        any |= all(read.getEnable());
+        any = sets.unite(any, all(read.getEnable()));
       for (auto &bit : bits)
         bit = any;
     }
@@ -446,7 +507,7 @@ const BitDeps &Threader::getDeps(Value value) {
         copyBits(get.getInput(), e * width, 0, width);
       auto indexDeps = all(get.getIndex());
       for (auto &bit : bits)
-        bit |= indexDeps;
+        bit = sets.unite(bit, indexDeps);
     }
   } else if (auto slice = dyn_cast<hw::ArraySliceOp>(op);
              slice &&
@@ -478,14 +539,15 @@ const BitDeps &Threader::getDeps(Value value) {
     copyBits(mux.getFalseValue(), 0, 0, width);
     auto condDeps = all(mux.getCond());
     for (auto &bit : bits)
-      bit |= condDeps;
+      bit = sets.unite(bit, condDeps);
   } else {
-    llvm::BitVector any(inputs.size());
+    unsigned any = 0;
     for (auto operand : op->getOperands())
-      any |= all(operand);
+      any = sets.unite(any, all(operand));
     for (auto &bit : bits)
       bit = any;
   }
+  depsInProgress.erase(value);
   deps[value] = std::move(result);
   return *deps[value];
 }
@@ -503,16 +565,16 @@ void Threader::computeDeps() {
             output.getOperand(field.argNum)));
       channel.current = b.createOrFold<comb::ConcatOp>(parts);
       channel.deps = llvm::BitVector(inputs.size());
-      for (auto &bit : getDeps(channel.current))
-        channel.deps |= bit;
+      for (auto bit : getDeps(channel.current))
+        channel.deps |= depSets->get(bit);
       continue;
     }
     auto value = output.getOperand(channel.argNum);
     channel.current = value;
     channel.deps = llvm::BitVector(inputs.size());
     auto width = hw::getBitWidth(channel.type);
-    for (auto &bit : ArrayRef(getDeps(value)).slice(channel.low, width))
-      channel.deps |= bit;
+    for (auto bit : ArrayRef(getDeps(value)).slice(channel.low, width))
+      channel.deps |= depSets->get(bit);
   }
 }
 
@@ -704,12 +766,19 @@ static Value hoistMux(ImplicitLocOpBuilder &b, Value value) {
     Value cond;
     for (auto operand : concat.getInputs()) {
       pieces.push_back(hoistMux(b, operand));
-      if (auto mux = pieces.back().getDefiningOp<comb::MuxOp>(); mux && !cond)
-        cond = mux.getCond();
+      auto mux = pieces.back().getDefiningOp<comb::MuxOp>();
+      if (!mux)
+        continue;
+      // Pieces under different conditions have no one write enable; hoisting
+      // them one condition at a time would split the register's next value
+      // into a branch per combination of them.
+      if (cond && mux.getCond() != cond)
+        return value;
+      cond = mux.getCond();
     }
     if (!cond)
       return value;
-    // The pieces under another condition are the same on both sides.
+    // The pieces that are not muxes are the same on both sides.
     SmallVector<Value> onTrue, onFalse;
     for (auto piece : pieces) {
       auto mux = piece.getDefiningOp<comb::MuxOp>();
