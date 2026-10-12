@@ -98,3 +98,41 @@ hw.module @AggParent(in %clk : !seq.clock, in %x : i4, out q : i8) {
 // NET-DAG:     [[CCODE]] = comb.extract %c.code from 3 : (i4) -> i1
 // NET-DAG:     [[ID1]] = hw.constant 1 : i2
 // NET:         hw.output %logic.z, %logic.w : i8, i4
+
+// RUN: circt-opt %s --maxsim-extract-models="module=Mix models=Src,Dst netlist" | FileCheck %s --check-prefix=MIX
+
+// In a netlist, an input wired from bits of several models' outputs and
+// constants is connected to them directly, not through the parent's model; a
+// bit an output always holds (`k`'s top two) is that constant.
+// MIX-LABEL: hw.module private @Mix_model(in %clk : !seq.clock, in %x : i4, in %d_y : i8, out z : i8)
+// MIX-LABEL: hw.module @Mix(
+// MIX-DAG:     %p.y, %p.k = hw.instance "p" @Src(
+// MIX-DAG:     %q.y, %q.k = hw.instance "q" @Src(
+// MIX-DAG:     %d.y = hw.instance "d" @Dst(clk: %clk: !seq.clock, a: [[A:%[0-9]+]]: i8)
+// MIX-DAG:     [[PY:%[0-9]+]] = comb.extract %p.y from 1 : (i4) -> i3
+// MIX-DAG:     [[KC:%[-a-z0-9_]+]] = hw.constant -2 : i2
+// MIX-DAG:     [[KL:%[0-9]+]] = comb.extract %q.k from 0 : (i4) -> i2
+// MIX-DAG:     [[A]] = comb.concat %true, [[PY]], [[KC]], [[KL]] : i1, i3, i2, i2
+hw.module @Src(in %clk : !seq.clock, in %a : i4, out y : i4, out k : i4) {
+  %c2 = hw.constant -2 : i2
+  %y = seq.firreg %a clock %clk : i4
+  %lo = comb.extract %a from 0 : (i4) -> i2
+  %r = seq.firreg %lo clock %clk : i2
+  %k = comb.concat %c2, %r : i2, i2
+  hw.output %y, %k : i4, i4
+}
+hw.module @Dst(in %clk : !seq.clock, in %a : i8, out y : i8) {
+  %y = seq.firreg %a clock %clk : i8
+  hw.output %y : i8
+}
+hw.module @Mix(in %clk : !seq.clock, in %x : i4, out z : i8) {
+  %c1 = hw.constant 1 : i1
+  %p.y, %p.k = hw.instance "p" @Src(clk: %clk: !seq.clock, a: %x: i4) -> (y: i4, k: i4)
+  %q.y, %q.k = hw.instance "q" @Src(clk: %clk: !seq.clock, a: %x: i4) -> (y: i4, k: i4)
+  %py = comb.extract %p.y from 1 : (i4) -> i3
+  %kh = comb.extract %q.k from 2 : (i4) -> i2
+  %kl = comb.extract %q.k from 0 : (i4) -> i2
+  %in = comb.concat %c1, %py, %kh, %kl : i1, i3, i2, i2
+  %d.y = hw.instance "d" @Dst(clk: %clk: !seq.clock, a: %in: i8) -> (y: i8)
+  hw.output %d.y : i8
+}

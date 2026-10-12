@@ -424,10 +424,27 @@ void MaxsimExtractModelsPass::runOnOperation() {
       // An input the model does not read is not a channel of the model.
       if (model && model.getBodyBlock()->getArgument(index).use_empty())
         continue;
-      auto &sources = tracer.get(operand);
+      auto sources = tracer.get(operand);
       auto isConstant = [](auto &source) {
         return source.kind == BitSource::Constant;
       };
+      // In a netlist, a bit a model's output always holds is that constant: the
+      // model does not export it.
+      for (auto &source : sources) {
+        if (!netlist || source.kind != BitSource::Port ||
+            isa<BlockArgument>(source.port))
+          continue;
+        auto result = cast<OpResult>(source.port);
+        auto constants =
+            constantOutputs.lookup(cast<hw::InstanceOp>(result.getOwner())
+                                       .getModuleNameAttr()
+                                       .getAttr());
+        if (constants.empty())
+          continue;
+        auto &bit = constants[result.getResultNumber()][source.bit];
+        if (bit.kind == BitSource::Constant)
+          source = bit;
+      }
       // Wired from inputs of the parent and constants, or exactly one output
       // of a model with no constant bits, which is a channel as a whole.
       bool direct = llvm::all_of(sources, [&](auto &source) {
@@ -445,6 +462,13 @@ void MaxsimExtractModelsPass::runOnOperation() {
                           bit.value().bit == bit.index();
                  });
       }
+      // In a netlist, any mix of model outputs' bits, inputs of the parent and
+      // constants is connected directly: the consumer reads each producer, and
+      // the parent's model does not pass the bits on a cycle later.
+      if (!direct && netlist)
+        direct = !sources.empty() && llvm::none_of(sources, [](auto &source) {
+          return source.kind == BitSource::Logic;
+        });
       auto portName = base + "_" + cast<StringAttr>(name).getValue().str();
       if (direct && netlist) {
         inputPlans[{instanceIndex, index}].bits = sources;
