@@ -25,6 +25,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Debug.h"
+#include <map>
 
 namespace circt {
 #define GEN_PASS_DEF_MAXSIMCOMPOSE
@@ -85,10 +86,13 @@ struct Producer {
   /// Built: each thread's token count, and slots in registers or a memory.
   SmallVector<Value> enq;
   SmallVector<std::array<Value, 2>> slots;
-  /// The memory's copies, each written alike and read by up to
-  /// kMaxReadPorts readers, and its write.
-  SmallVector<Value> mems;
-  unsigned readPorts = 0;
+  /// The memories of the bits readers read, by low bit and width: each has
+  /// copies written alike, read by up to kMaxReadPorts readers.
+  struct Memories {
+    SmallVector<Value> copies;
+    unsigned readPorts = 0;
+  };
+  std::map<std::pair<unsigned, unsigned>, Memories> mems;
   Value writeAddress, writeEnable, writeData;
 };
 
@@ -121,7 +125,7 @@ private:
   LogicalResult decompose(Value value, unsigned low, unsigned width,
                           Pieces &pieces);
   LogicalResult build();
-  Value tokenMemory(Producer &producer);
+  Value tokenMemory(Producer &producer, unsigned low, unsigned width);
 
   /// The read ports of a copy of a token memory.
   static constexpr unsigned kMaxReadPorts = 8;
@@ -425,32 +429,38 @@ LogicalResult Composer::decompose(Value value, unsigned low, unsigned width,
   return op->emitError("not wiring of a netlist");
 }
 
-/// A copy of `producer`'s token memory with a read port to spare: FPGA tools
-/// map a memory of up to 16 ports to distributed RAM, which has a copy per
-/// read port anyway, so a producer with many readers gets several memories
-/// written alike.
-Value Composer::tokenMemory(Producer &producer) {
-  if (producer.readPorts++ % kMaxReadPorts == 0) {
+/// A memory of `width` bits of `producer`'s tokens from `low`, with a read
+/// port to spare. Readers of different bits read memories of their own bits:
+/// distributed RAM has a copy per read port, and a port of the whole token
+/// would keep every bit in it. FPGA tools map a memory of up to 16 ports to
+/// distributed RAM, so a range with many readers has several copies.
+Value Composer::tokenMemory(Producer &producer, unsigned low, unsigned width) {
+  auto &memories = producer.mems[{low, width}];
+  if (memories.readPorts++ % kMaxReadPorts == 0) {
     OpBuilder b(producer.writeAddress.getContext());
     b.setInsertionPointAfterValue(producer.writeData);
     auto loc = producer.writeAddress.getLoc();
     unsigned threadBits = llvm::Log2_32_Ceil(producer.threads);
-    auto type = seq::FirMemType::get(b.getContext(), 2ULL << threadBits,
-                                     producer.width, std::nullopt);
-    auto name =
-        producer.name + "_tokens" +
-        (producer.mems.empty() ? ""
-                               : "_" + std::to_string(producer.mems.size()));
+    auto type = seq::FirMemType::get(b.getContext(), 2ULL << threadBits, width,
+                                     std::nullopt);
+    std::string name = producer.name + "_tokens";
+    if (width != producer.width)
+      name += "_" + std::to_string(low + width - 1) + "_" + std::to_string(low);
+    if (!memories.copies.empty())
+      name += "_" + std::to_string(memories.copies.size());
     Value mem = seq::FirMemOp::create(
         b, loc, type, /*readLatency=*/0, /*writeLatency=*/1,
         seq::RUW::Undefined, seq::WUW::Undefined, b.getStringAttr(name),
         hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, StringAttr{});
+    Value data = producer.writeData;
+    if (width != producer.width)
+      data = b.createOrFold<comb::ExtractOp>(loc, b.getIntegerType(width), data,
+                                             low);
     seq::FirMemWriteOp::create(b, loc, mem, producer.writeAddress, hostClock,
-                               producer.writeEnable, producer.writeData,
-                               Value{});
-    producer.mems.push_back(mem);
+                               producer.writeEnable, data, Value{});
+    memories.copies.push_back(mem);
   }
-  return producer.mems.back();
+  return memories.copies.back();
 }
 
 LogicalResult Composer::build() {
@@ -798,10 +808,9 @@ LogicalResult Composer::build() {
           }
           Value address = comb::ConcatOp::create(
               b, select(threads, sink.thread), select(slots, sink.thread));
-          Value data = seq::FirMemReadOp::create(b, tokenMemory(producer),
-                                                 address, hostClock, bit(true));
-          parts.push_back(b.createOrFold<comb::ExtractOp>(
-              b.getIntegerType(piece.width), data, piece.low));
+          parts.push_back(seq::FirMemReadOp::create(
+              b, tokenMemory(producer, piece.low, piece.width), address,
+              hostClock, bit(true)));
           continue;
         }
         for (unsigned t = 0; t < consumer.threads; ++t)
