@@ -24,6 +24,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/Support/Debug.h"
 #include <map>
 #include <numeric>
 
@@ -31,6 +32,8 @@ namespace circt {
 #define GEN_PASS_DEF_MAXSIMFAME5
 #include "circt/Transforms/Passes.h.inc"
 } // namespace circt
+
+#define DEBUG_TYPE "maxsim-fame5"
 
 using namespace mlir;
 using namespace circt;
@@ -960,6 +963,13 @@ LogicalResult Threader::run() {
                     !dependsOnMemory(channel.current);
     if (channel.eager)
       channel.next = getNext(channel.current, b);
+    LLVM_DEBUG({
+      llvm::dbgs() << "maxsim-deps " << name << " " << channel.name.getValue()
+                   << (channel.eager ? " eager" : "") << " <-";
+      for (auto dep : channel.deps.set_bits())
+        llvm::dbgs() << " " << inputs[dep].name.getValue();
+      llvm::dbgs() << "\n";
+    });
   }
 
   // Each register keeps one value per thread. The branches of its next value

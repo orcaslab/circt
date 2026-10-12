@@ -24,11 +24,14 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/Debug.h"
 
 namespace circt {
 #define GEN_PASS_DEF_MAXSIMCOMPOSE
 #include "circt/Transforms/Passes.h.inc"
 } // namespace circt
+
+#define DEBUG_TYPE "maxsim-compose"
 
 using namespace mlir;
 using namespace circt;
@@ -416,6 +419,17 @@ LogicalResult Composer::decompose(Value value, unsigned low, unsigned width,
 LogicalResult Composer::build() {
   auto *context = top.getContext();
   auto i1 = IntegerType::get(context, 1);
+  LLVM_DEBUG({
+    for (auto &consumer : consumers)
+      for (auto [t, pieces] : llvm::enumerate(consumer.pieces)) {
+        llvm::dbgs() << "maxsim-net " << consumer.name << " " << t << " <-";
+        for (auto &piece : pieces)
+          if (piece.producer >= 0)
+            llvm::dbgs() << " " << producers[piece.producer].name << "@"
+                         << piece.thread;
+        llvm::dbgs() << "\n";
+      }
+  });
 
   // The simulator's ports.
   SmallVector<hw::PortInfo> ports;
