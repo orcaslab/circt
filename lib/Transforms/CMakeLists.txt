@@ -8,6 +8,7 @@ add_circt_library(CIRCTTransforms
   MapArithToComb.cpp
   MaxsimCompose.cpp
   MaxsimExtractModels.cpp
+  MaxsimFuseModels.cpp
   MaxsimFAME5.cpp
   MaximizeSSA.cpp
   MemoryBanking.cpp

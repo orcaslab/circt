@@ -305,6 +305,35 @@ def MaxsimExtractModels : Pass<"maxsim-extract-models", "::mlir::ModuleOp"> {
   ];
 }
 
+def MaxsimFuseModels : Pass<"maxsim-fuse-models", "::mlir::ModuleOp"> {
+  let summary = "Simulate pairs of connected models of a netlist as one model";
+  let description = [{
+    For each group `A+B` of `groups`, the instances of `A` and `B` in the
+    netlist `module` (as `maxsim-extract-models` with `netlist` leaves it) are
+    paired, each `A` with the one `B` it exchanges bits with, and each pair is
+    replaced by an instance of one flat model, `A_B`, of both models' logic.
+    An input of one wired only from the other's outputs and constants, alike
+    in every pair, is connected inside it; the other inputs and every output
+    are its ports, named `<model>_<port>`. Both models' clocks must be the
+    same clock.
+
+    A combinational path from one model through the other and back is then a
+    path inside one model, which a thread follows in one host cycle, rather
+    than a round trip through the channels between two models. The pair is
+    one copy of each model's logic, threaded as before.
+  }];
+  let options = [
+    Option<"moduleName", "module", "std::string", "",
+           "The netlist the models are instantiated in">,
+    ListOption<"groups", "groups", "std::string",
+               "The pairs of models to fuse, as <A>+<B>">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect"
+  ];
+}
+
 def MaxsimCompose : Pass<"maxsim-compose", "::mlir::ModuleOp"> {
   let summary = "Compose a simulator of threaded models from a netlist";
   let description = [{
