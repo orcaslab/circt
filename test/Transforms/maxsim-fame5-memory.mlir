@@ -1,4 +1,16 @@
 // RUN: circt-opt %s --maxsim-fame5="module=Mem threads=4" | FileCheck %s
+// RUN: circt-opt %s --maxsim-fame5="module=Mem threads=1" | FileCheck %s --check-prefix=ONE
+
+// One thread keeps a registered read's data the same way: the read port's data
+// is there only on the host cycle after the target edge, so a register holds it.
+// ONE-LABEL: hw.module @Mem_threaded_Mem(
+// ONE: [[DOUT:%.+]] = seq.firmem.read_port %ram[%raddr_sink_bits], clock %clk_buffer.O
+// ONE: %read_edge = seq.firreg %true clock %clk_buffer.O : i1
+// ONE: %ram_rdata = seq.firreg [[NEXT:%.+]] clock %hostClock : i8
+// ONE: [[EDGE:%.+]] = comb.xor %target_toggle, %target_toggle_seen : i1
+// ONE: [[WRITE:%.+]] = comb.and [[EDGE]], %read_edge : i1
+// ONE: [[NEXT]] = comb.mux [[WRITE]], [[DOUT]], %ram_rdata : i8
+// ONE-NOT: read_thread
 
 // `unused` is not read, so it has no channel; `t` has no bits, so its channel
 // carries tokens only.
@@ -23,13 +35,13 @@
 // CHECK: %ram = seq.firmem 1, 1, old, undefined : <32 x 8>
 // CHECK: [[DOUT:%.+]] = seq.firmem.read_port %ram[{{%.+}}], clock %clk_buffer.O
 // CHECK: %read_edge = seq.firreg %true clock %clk_buffer.O : i1
-// CHECK: %read_thread = seq.firreg %threadIdx clock %clk_buffer.O : i2
 // CHECK: %ram_rdata = seq.firmem 0, 1, undefined, undefined : <4 x 8, mask 1>
 // CHECK: [[R:%.+]] = seq.firmem.read_port %ram_rdata[%threadIdx], clock %hostClock
 // CHECK: %target_toggle = seq.firreg {{%.+}} clock %clk_buffer.O preset 0 : i1
 // CHECK: %target_toggle_seen = seq.firreg %target_toggle clock %hostClock preset 0 : i1
 // CHECK: [[EDGE:%.+]] = comb.xor %target_toggle, %target_toggle_seen : i1
 // CHECK: [[WRITE:%.+]] = comb.and [[EDGE]], %read_edge : i1
+// CHECK: %read_thread = seq.firreg %threadIdx clock %clk_buffer.O : i2
 // CHECK: seq.firmem.write_port %ram_rdata[%read_thread] = [[DOUT]], clock %hostClock enable [[WRITE]]
 
 // CHECK: hw.output {{.*}}, [[Q]], {{.*}}, [[R]], {{%.+}} : i1, i1, i1, i1, i1, i8, i1, i8, i1

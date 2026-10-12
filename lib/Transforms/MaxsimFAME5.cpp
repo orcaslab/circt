@@ -1036,17 +1036,15 @@ LogicalResult Threader::run() {
       }
       auto read = cast<seq::FirMemReadOp>(user);
       Value data;
-      if (threads == 1) {
-        // One thread's registered read is the target's own.
-        data = seq::FirMemReadOp::create(
-            b, threadedMemory, read.getAddress(),
-            memory.getReadLatency() == 0 ? hostClock : targetClock,
-            read.getEnable());
-      } else if (memory.getReadLatency() == 0) {
+      if (memory.getReadLatency() == 0) {
         data = seq::FirMemReadOp::create(b, threadedMemory,
                                          addressOf(read.getAddress()),
                                          hostClock, read.getEnable());
       } else {
+        // A registered read's data is only there on the host cycle after the
+        // target edge that read it, even for one thread: once the target
+        // clock runs on the host clock with an enable, so does the read. The
+        // thread keeps it until its next read.
         Value dout = seq::FirMemReadOp::create(b, threadedMemory,
                                                addressOf(read.getAddress()),
                                                targetClock, read.getEnable());
@@ -1055,15 +1053,19 @@ LogicalResult Threader::run() {
                            : Value(hw::ConstantOp::create(b, i1, 1));
         auto readEdge = seq::FirRegOp::create(b, enable, targetClock,
                                               b.getStringAttr("read_edge"));
-        auto readThread = seq::FirRegOp::create(b, threadIdx, targetClock,
-                                                b.getStringAttr("read_thread"));
         Value buffer;
         data = createThreadState(
             b, (memory.getName().value_or("mem") + "_rdata").str(),
             dout.getType(), buffer);
-        seq::FirMemWriteOp::create(
-            b, buffer, readThread, hostClock,
-            comb::AndOp::create(b, getEdgeSeen(), readEdge), dout, Value{});
+        Value capture = comb::AndOp::create(b, getEdgeSeen(), readEdge);
+        if (threads == 1) {
+          writeThreadState(b, buffer, hostClock, dout, capture);
+        } else {
+          auto readThread = seq::FirRegOp::create(
+              b, threadIdx, targetClock, b.getStringAttr("read_thread"));
+          seq::FirMemWriteOp::create(b, buffer, readThread, hostClock, capture,
+                                     dout, Value{});
+        }
       }
       read.getData().replaceAllUsesWith(data);
       replaced[read.getData()] = data;
