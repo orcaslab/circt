@@ -85,7 +85,11 @@ struct Producer {
   /// Built: each thread's token count, and slots in registers or a memory.
   SmallVector<Value> enq;
   SmallVector<std::array<Value, 2>> slots;
-  Value mem;
+  /// The memory's copies, each written alike and read by up to
+  /// kMaxReadPorts readers, and its write.
+  SmallVector<Value> mems;
+  unsigned readPorts = 0;
+  Value writeAddress, writeEnable, writeData;
 };
 
 /// A sink of tokens: an input of a model, or an output of the netlist.
@@ -117,6 +121,11 @@ private:
   LogicalResult decompose(Value value, unsigned low, unsigned width,
                           Pieces &pieces);
   LogicalResult build();
+  Value tokenMemory(Producer &producer);
+
+  /// The read ports of a copy of a token memory.
+  static constexpr unsigned kMaxReadPorts = 8;
+  Value hostClock;
 
   ModuleOp top;
   hw::HWModuleOp netlist;
@@ -125,7 +134,7 @@ private:
   llvm::SmallPtrSet<Operation *, 4> inlined;
   std::vector<Class> classes;
   DenseMap<Operation *, std::pair<unsigned, unsigned>> threadOf;
-  SmallVector<Producer> producers;
+  std::vector<Producer> producers;
   SmallVector<Consumer> consumers;
   /// The producer of each input of the netlist, or -1 for a clock.
   SmallVector<int> inputProducer;
@@ -416,6 +425,34 @@ LogicalResult Composer::decompose(Value value, unsigned low, unsigned width,
   return op->emitError("not wiring of a netlist");
 }
 
+/// A copy of `producer`'s token memory with a read port to spare: FPGA tools
+/// map a memory of up to 16 ports to distributed RAM, which has a copy per
+/// read port anyway, so a producer with many readers gets several memories
+/// written alike.
+Value Composer::tokenMemory(Producer &producer) {
+  if (producer.readPorts++ % kMaxReadPorts == 0) {
+    OpBuilder b(producer.writeAddress.getContext());
+    b.setInsertionPointAfterValue(producer.writeData);
+    auto loc = producer.writeAddress.getLoc();
+    unsigned threadBits = llvm::Log2_32_Ceil(producer.threads);
+    auto type = seq::FirMemType::get(b.getContext(), 2ULL << threadBits,
+                                     producer.width, std::nullopt);
+    auto name =
+        producer.name + "_tokens" +
+        (producer.mems.empty() ? ""
+                               : "_" + std::to_string(producer.mems.size()));
+    Value mem = seq::FirMemOp::create(
+        b, loc, type, /*readLatency=*/0, /*writeLatency=*/1,
+        seq::RUW::Undefined, seq::WUW::Undefined, b.getStringAttr(name),
+        hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, StringAttr{});
+    seq::FirMemWriteOp::create(b, loc, mem, producer.writeAddress, hostClock,
+                               producer.writeEnable, producer.writeData,
+                               Value{});
+    producer.mems.push_back(mem);
+  }
+  return producer.mems.back();
+}
+
 LogicalResult Composer::build() {
   auto *context = top.getContext();
   auto i1 = IntegerType::get(context, 1);
@@ -483,7 +520,8 @@ LogicalResult Composer::build() {
   body->getTerminator()->erase();
   auto b = ImplicitLocOpBuilder::atBlockEnd(netlist.getLoc(), body);
   BackedgeBuilder backedges(b, netlist.getLoc());
-  Value hostClock = body->getArgument(0), hostReset = body->getArgument(1);
+  hostClock = body->getArgument(0);
+  Value hostReset = body->getArgument(1);
   SmallVector<Value> outputs(numOut);
 
   auto constant = [&](const APInt &value) -> Value {
@@ -673,18 +711,10 @@ LogicalResult Composer::build() {
       return comb::ExtractOp::create(b, i1, count, 0);
     };
     if (producer.memory) {
-      unsigned threadBits = llvm::Log2_32_Ceil(producer.threads);
-      auto type = seq::FirMemType::get(context, 2ULL << threadBits,
-                                       producer.width, std::nullopt);
-      producer.mem = seq::FirMemOp::create(
-          b, type, /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined,
-          seq::WUW::Undefined, b.getStringAttr(producer.name + "_tokens"),
-          hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{},
-          StringAttr{});
       Value slot = slotOf(select(producer.enq, source.thread));
-      Value address = comb::ConcatOp::create(b, source.thread, slot);
-      seq::FirMemWriteOp::create(b, producer.mem, address, hostClock, fire,
-                                 source.bits, Value{});
+      producer.writeAddress = comb::ConcatOp::create(b, source.thread, slot);
+      producer.writeEnable = fire;
+      producer.writeData = source.bits;
       continue;
     }
     for (unsigned k = 0; k < producer.threads; ++k) {
@@ -768,8 +798,8 @@ LogicalResult Composer::build() {
           }
           Value address = comb::ConcatOp::create(
               b, select(threads, sink.thread), select(slots, sink.thread));
-          Value data = seq::FirMemReadOp::create(b, producer.mem, address,
-                                                 hostClock, bit(true));
+          Value data = seq::FirMemReadOp::create(b, tokenMemory(producer),
+                                                 address, hostClock, bit(true));
           parts.push_back(b.createOrFold<comb::ExtractOp>(
               b.getIntegerType(piece.width), data, piece.low));
           continue;
