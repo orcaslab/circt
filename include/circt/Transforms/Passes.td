@@ -286,10 +286,20 @@ def MaxsimExtractModels : Pass<"maxsim-extract-models", "::mlir::ModuleOp"> {
     stay valid, so a netlist can be cut out of its own parent in turn. A model
     output the parent's logic does not read then has no input on it, and a
     model input only constants drive is connected to them.
+
+    With `absorb-logic=N`, an input of a model that the parent drives with
+    logic of at most N ops over models' outputs, inputs of the parent and the
+    parent's state, the same logic for every instance of the model, is
+    computed in the model instead: the model takes the logic's operands as
+    inputs of its own. A model's input then comes from the models that
+    produce its operands rather than from a hop through the parent's model.
   }];
   let options = [
     Option<"moduleName", "module", "std::string", "",
            "The parent to cut the models out of">,
+    Option<"absorbLogic", "absorb-logic", "unsigned", "0",
+           "Move logic of up to this many ops driving a model's input into "
+           "the model">,
     ListOption<"models", "models", "std::string",
                "The modules simulated as separate models">,
     Option<"netlist", "netlist", "bool", "false",

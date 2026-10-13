@@ -18,13 +18,17 @@
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 #include "circt/Transforms/Passes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include <functional>
 
 namespace circt {
 #define GEN_PASS_DEF_MAXSIMEXTRACTMODELS
@@ -332,6 +336,242 @@ static SmallVector<BitSources> getConstantOutputs(hw::HWModuleOp model) {
   return outputs;
 }
 
+namespace {
+/// Moves the logic in a parent that drives models' inputs into the models.
+class LogicAbsorber {
+public:
+  LogicAbsorber(ModuleOp top, hw::HWModuleOp parent,
+                const llvm::StringSet<> &modelNames, unsigned limit)
+      : top(top), parent(parent), modelNames(modelNames), limit(limit) {}
+  void run();
+
+private:
+  bool dependsOnPorts(Value value);
+  bool isConeOp(Operation *op);
+  bool collect(Value root, SmallVectorImpl<Operation *> &ops,
+               SmallVectorImpl<Value> &leaves);
+  bool match(Value a, Value b, DenseMap<Value, Value> &leafMap,
+             DenseMap<Value, Value> &matched);
+
+  ModuleOp top;
+  hw::HWModuleOp parent;
+  const llvm::StringSet<> &modelNames;
+  unsigned limit;
+  DenseMap<Value, bool> portDeps;
+  /// Inputs added to a model, by the value each instance gives them.
+  DenseMap<Operation *, SmallVector<std::pair<SmallVector<Value>, Value>>>
+      absorbedInputs;
+};
+} // namespace
+
+/// Whether `value` is computed, through logic, from an input of the parent or
+/// an output of a model: what is not is the parent's state and constants.
+bool LogicAbsorber::dependsOnPorts(Value value) {
+  if (auto it = portDeps.find(value); it != portDeps.end())
+    return it->second;
+  auto *op = value.getDefiningOp();
+  bool result;
+  if (!op || isa<hw::InstanceOp>(op))
+    result = true;
+  else if (!isConeOp(op))
+    result = false;
+  else {
+    portDeps[value] = false;
+    result = llvm::any_of(op->getOperands(), [&](Value operand) {
+      return dependsOnPorts(operand);
+    });
+  }
+  return portDeps[value] = result;
+}
+
+/// Whether `op` is logic that can be computed anywhere: no state, no regions,
+/// no side effects.
+bool LogicAbsorber::isConeOp(Operation *op) {
+  return op->getNumRegions() == 0 && isMemoryEffectFree(op) &&
+         !isa<hw::InstanceOp, seq::FirRegOp, seq::FirMemReadOp,
+              seq::FirMemReadWriteOp>(op) &&
+         op->getNumResults() >= 1;
+}
+
+/// The logic computing `root` from the ports, in operand-first order, and the
+/// values it reads: ports, the parent's state, or other logic's results that do
+/// not depend on ports. Fails if there is none or it is over the limit.
+bool LogicAbsorber::collect(Value root, SmallVectorImpl<Operation *> &ops,
+                            SmallVectorImpl<Value> &leaves) {
+  DenseSet<Operation *> seen;
+  DenseSet<Value> leafSet;
+  std::function<bool(Value)> visit = [&](Value value) -> bool {
+    auto *op = value.getDefiningOp();
+    bool inside = op && isConeOp(op) &&
+                  (dependsOnPorts(value) || op->getNumOperands() == 0);
+    if (!inside) {
+      if (leafSet.insert(value).second)
+        leaves.push_back(value);
+      return true;
+    }
+    if (!seen.insert(op).second)
+      return true;
+    for (auto operand : op->getOperands())
+      if (!visit(operand))
+        return false;
+    ops.push_back(op);
+    return ops.size() <= limit;
+  };
+  auto *rootOp = root.getDefiningOp();
+  if (!rootOp || !isConeOp(rootOp) || !dependsOnPorts(root))
+    return false;
+  if (!visit(root))
+    return false;
+  // Only wiring is connected directly already.
+  return llvm::any_of(ops, [](Operation *op) {
+    return !BitTracer::isWiring(op) && !isa<hw::ConstantOp>(op);
+  });
+}
+
+/// Whether `b` is the same logic as `a`, its leaves in `leafMap`.
+bool LogicAbsorber::match(Value a, Value b, DenseMap<Value, Value> &leafMap,
+                          DenseMap<Value, Value> &matched) {
+  if (auto it = leafMap.find(a); it != leafMap.end()) {
+    if (!it->second)
+      return (it->second = b), true;
+    return it->second == b;
+  }
+  if (auto it = matched.find(a); it != matched.end())
+    return it->second == b;
+  matched[a] = b;
+  auto *opA = a.getDefiningOp(), *opB = b.getDefiningOp();
+  if (!opA || !opB || opA->getName() != opB->getName() ||
+      opA->getAttrDictionary() != opB->getAttrDictionary() ||
+      opA->getResultTypes() != opB->getResultTypes() ||
+      opA->getNumOperands() != opB->getNumOperands() ||
+      cast<OpResult>(a).getResultNumber() !=
+          cast<OpResult>(b).getResultNumber())
+    return false;
+  for (auto [x, y] : llvm::zip(opA->getOperands(), opB->getOperands()))
+    if (!match(x, y, leafMap, matched))
+      return false;
+  return true;
+}
+
+void LogicAbsorber::run() {
+  llvm::MapVector<StringAttr, SmallVector<hw::InstanceOp>> byModel;
+  for (auto instance : parent.getBodyBlock()->getOps<hw::InstanceOp>())
+    if (modelNames.contains(instance.getModuleName()))
+      byModel[instance.getModuleNameAttr().getAttr()].push_back(instance);
+
+  for (auto &[name, instances] : byModel) {
+    // A netlist holds only models and wiring.
+    auto model = dyn_cast_or_null<hw::HWModuleOp>(
+        SymbolTable::lookupSymbolIn(top, name));
+    if (!model || model->hasAttr("maxsim.netlist"))
+      continue;
+    // The model gains ports, so every instance of it must be one of these.
+    unsigned numInstances = 0;
+    top.walk([&](hw::InstanceOp instance) {
+      numInstances += instance.getModuleNameAttr().getAttr() == name;
+    });
+    if (numInstances != instances.size())
+      continue;
+    for (unsigned index = 0; index < model.getNumInputPorts(); ++index) {
+      auto arg = model.getBodyBlock()->getArgument(index);
+      if (arg.use_empty() || isa<seq::ClockType>(arg.getType()))
+        continue;
+      // The logic of the first instance, and every other instance's leaves
+      // for it.
+      SmallVector<Operation *> ops;
+      SmallVector<Value> leaves;
+      portDeps.clear();
+      if (!collect(instances[0].getOperand(index), ops, leaves))
+        continue;
+      SmallVector<SmallVector<Value>> leavesOf;
+      bool same = true;
+      for (auto instance : instances) {
+        DenseMap<Value, Value> leafMap;
+        for (auto leaf : leaves)
+          leafMap[leaf] = Value();
+        DenseMap<Value, Value> matched;
+        if (!match(instances[0].getOperand(index), instance.getOperand(index),
+                   leafMap, matched)) {
+          same = false;
+          break;
+        }
+        auto &mapped = leavesOf.emplace_back();
+        for (auto leaf : leaves)
+          mapped.push_back(leafMap[leaf]);
+      }
+      if (!same)
+        continue;
+
+      // A leaf that is every instance's own output is that output inside the
+      // model; any other is a new input.
+      auto *output = model.getBodyBlock()->getTerminator();
+      SmallVector<std::optional<unsigned>> ownOutput(leaves.size());
+      for (auto [k, leaf] : llvm::enumerate(leaves)) {
+        auto result = dyn_cast<OpResult>(leaf);
+        if (!result || result.getOwner() != instances[0].getOperation())
+          continue;
+        bool own = true;
+        for (auto [i, instance] : llvm::enumerate(instances)) {
+          auto other = dyn_cast<OpResult>(leavesOf[i][k]);
+          own &= other && other.getOwner() == instance.getOperation() &&
+                 other.getResultNumber() == result.getResultNumber();
+        }
+        if (own)
+          ownOutput[k] = result.getResultNumber();
+      }
+      IRMapping mapping;
+      auto baseName = model.getInputName(index);
+      SmallVector<bool> newPort(leaves.size(), false);
+      for (auto [k, leaf] : llvm::enumerate(leaves)) {
+        if (ownOutput[k]) {
+          mapping.map(leaf, output->getOperand(*ownOutput[k]));
+          continue;
+        }
+        // A value every instance already gives an earlier moved input.
+        SmallVector<Value> values;
+        for (auto &mapped : leavesOf)
+          values.push_back(mapped[k]);
+        auto &added = absorbedInputs[model.getOperation()];
+        auto it = llvm::find_if(
+            added, [&](auto &entry) { return entry.first == values; });
+        if (it != added.end()) {
+          mapping.map(leaf, it->second);
+          continue;
+        }
+        auto name = (baseName + "_" + Twine(k)).str();
+        auto port = model.appendInput(name, leaf.getType()).second;
+        added.push_back({values, port});
+        mapping.map(leaf, port);
+        newPort[k] = true;
+      }
+      OpBuilder b = OpBuilder::atBlockBegin(model.getBodyBlock());
+      for (auto *op : ops)
+        b.clone(*op, mapping);
+      arg.replaceAllUsesWith(mapping.lookup(instances[0].getOperand(index)));
+
+      // Each instance takes the leaves of its own logic. A leaf may be
+      // another instance's output, so all are created before any goes.
+      SmallVector<hw::InstanceOp> replacements;
+      for (auto [i, instance] : llvm::enumerate(instances)) {
+        SmallVector<Value> operands(instance.getInputs());
+        for (auto [k, leaf] : llvm::enumerate(leavesOf[i]))
+          if (newPort[k])
+            operands.push_back(leaf);
+        OpBuilder ib(instance);
+        replacements.push_back(hw::InstanceOp::create(
+            ib, instance.getLoc(), model, instance.getInstanceNameAttr(),
+            operands, instance.getParametersAttr(),
+            instance.getInnerSymAttr()));
+      }
+      for (auto [instance, replacement] : llvm::zip(instances, replacements))
+        instance.replaceAllUsesWith(replacement.getResults());
+      for (auto instance : instances)
+        instance.erase();
+      instances = replacements;
+    }
+  }
+}
+
 void MaxsimExtractModelsPass::runOnOperation() {
   auto top = getOperation();
   auto parent = dyn_cast_or_null<hw::HWModuleOp>(
@@ -355,6 +595,9 @@ void MaxsimExtractModelsPass::runOnOperation() {
     }
     givenInputs[fields[0]].push_back({hi, lo});
   }
+
+  if (absorbLogic)
+    LogicAbsorber(top, parent, modelNames, absorbLogic).run();
 
   auto *body = parent.getBodyBlock();
   auto originalPorts = parent.getPortList();

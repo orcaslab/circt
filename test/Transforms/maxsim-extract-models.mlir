@@ -136,3 +136,45 @@ hw.module @Mix(in %clk : !seq.clock, in %x : i4, out z : i8) {
   %d.y = hw.instance "d" @Dst(clk: %clk: !seq.clock, a: %in: i8) -> (y: i8)
   hw.output %d.y : i8
 }
+
+// RUN: circt-opt %s --maxsim-extract-models="module=Absorb models=Unit,Kept absorb-logic=4" | FileCheck %s --check-prefix=ABS
+
+// With `absorb-logic`, logic that drives the same input of every instance is
+// computed in the model: `en` comes from the model's own output and the
+// parent's input `go`, so the model takes `go` instead. `Kept` is also
+// instantiated outside the parent, so its ports stay as they are.
+// ABS-LABEL: hw.module @Unit(in %clk : !seq.clock, in %en : i1, in %d : i4, in %en_1 : i1, out busy : i1, out q : i4)
+// ABS-NEXT:    %true = hw.constant true
+// ABS-NEXT:    [[NB:%.+]] = comb.xor %r, %true : i1
+// ABS-NEXT:    [[EN:%.+]] = comb.and [[NB]], %en_1 : i1
+// ABS-NEXT:    %r = seq.firreg [[EN]] clock %clk : i1
+// ABS-LABEL: hw.module @Kept(in %clk : !seq.clock, in %en : i1, out busy : i1)
+// ABS-LABEL: hw.module @Absorb(
+// ABS-SAME:    in %k_busy : i1, out z : i4, out b : i1, out k_en : i1)
+// ABS-SAME:    maxsim.direct_inputs = ["u0_d = x", "u0_en_1 = go", "u1_d = u0_q", "u1_en_1 = go"]
+hw.module @Unit(in %clk : !seq.clock, in %en : i1, in %d : i4, out busy : i1, out q : i4) {
+  %r = seq.firreg %en clock %clk : i1
+  %q = seq.firreg %d clock %clk : i4
+  hw.output %r, %q : i1, i4
+}
+hw.module @Kept(in %clk : !seq.clock, in %en : i1, out busy : i1) {
+  %r = seq.firreg %en clock %clk : i1
+  hw.output %r : i1
+}
+hw.module @Absorb(in %clk : !seq.clock, in %go : i1, in %x : i4, out z : i4, out b : i1) {
+  %true = hw.constant true
+  %n0 = comb.xor %u0.busy, %true : i1
+  %e0 = comb.and %n0, %go : i1
+  %u0.busy, %u0.q = hw.instance "u0" @Unit(clk: %clk: !seq.clock, en: %e0: i1, d: %x: i4) -> (busy: i1, q: i4)
+  %n1 = comb.xor %u1.busy, %true : i1
+  %e1 = comb.and %n1, %go : i1
+  %u1.busy, %u1.q = hw.instance "u1" @Unit(clk: %clk: !seq.clock, en: %e1: i1, d: %u0.q: i4) -> (busy: i1, q: i4)
+  %nk = comb.xor %k.busy, %true : i1
+  %ek = comb.and %nk, %go : i1
+  %k.busy = hw.instance "k" @Kept(clk: %clk: !seq.clock, en: %ek: i1) -> (busy: i1)
+  hw.output %u1.q, %k.busy : i4, i1
+}
+hw.module @Other(in %clk : !seq.clock, in %en : i1, out busy : i1) {
+  %k.busy = hw.instance "k" @Kept(clk: %clk: !seq.clock, en: %en: i1) -> (busy: i1)
+  hw.output %k.busy : i1
+}
