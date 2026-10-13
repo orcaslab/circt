@@ -141,12 +141,13 @@ hw.module @Mix(in %clk : !seq.clock, in %x : i4, out z : i8) {
 
 // With `absorb-logic`, logic that drives the same input of every instance is
 // computed in the model: `en` comes from the model's own output and the
-// parent's input `go`, so the model takes `go` instead. `Kept` is also
-// instantiated outside the parent, so its ports stay as they are.
+// parent's input `go`, so the model takes `go` instead; names do not make
+// the instances' logic differ. `Kept` is also instantiated outside the
+// parent, so its ports stay as they are.
 // ABS-LABEL: hw.module @Unit(in %clk : !seq.clock, in %en : i1, in %d : i4, in %en_1 : i1, out busy : i1, out q : i4)
 // ABS-NEXT:    %true = hw.constant true
 // ABS-NEXT:    [[NB:%.+]] = comb.xor %r, %true : i1
-// ABS-NEXT:    [[EN:%.+]] = comb.and [[NB]], %en_1 : i1
+// ABS-NEXT:    [[EN:%.+]] = comb.and [[NB]], %en_1 {{.*}}: i1
 // ABS-NEXT:    %r = seq.firreg [[EN]] clock %clk : i1
 // ABS-LABEL: hw.module @Kept(in %clk : !seq.clock, in %en : i1, out busy : i1)
 // ABS-LABEL: hw.module @Absorb(
@@ -164,10 +165,10 @@ hw.module @Kept(in %clk : !seq.clock, in %en : i1, out busy : i1) {
 hw.module @Absorb(in %clk : !seq.clock, in %go : i1, in %x : i4, out z : i4, out b : i1) {
   %true = hw.constant true
   %n0 = comb.xor %u0.busy, %true : i1
-  %e0 = comb.and %n0, %go : i1
+  %e0 = comb.and %n0, %go {sv.namehint = "u0_en"} : i1
   %u0.busy, %u0.q = hw.instance "u0" @Unit(clk: %clk: !seq.clock, en: %e0: i1, d: %x: i4) -> (busy: i1, q: i4)
   %n1 = comb.xor %u1.busy, %true : i1
-  %e1 = comb.and %n1, %go : i1
+  %e1 = comb.and %n1, %go {sv.namehint = "u1_en"} : i1
   %u1.busy, %u1.q = hw.instance "u1" @Unit(clk: %clk: !seq.clock, en: %e1: i1, d: %u0.q: i4) -> (busy: i1, q: i4)
   %nk = comb.xor %k.busy, %true : i1
   %ek = comb.and %nk, %go : i1

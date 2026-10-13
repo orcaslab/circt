@@ -428,6 +428,16 @@ bool LogicAbsorber::collect(Value root, SmallVectorImpl<Operation *> &ops,
   });
 }
 
+/// Whether two ops have the same attributes, names aside.
+static bool sameAttributes(Operation *a, Operation *b) {
+  auto filtered = [](Operation *op) {
+    NamedAttrList attrs(op->getAttrDictionary());
+    attrs.erase("sv.namehint");
+    return attrs.getDictionary(op->getContext());
+  };
+  return filtered(a) == filtered(b);
+}
+
 /// Whether `b` is the same logic as `a`, its leaves in `leafMap`.
 bool LogicAbsorber::match(Value a, Value b, DenseMap<Value, Value> &leafMap,
                           DenseMap<Value, Value> &matched) {
@@ -441,7 +451,7 @@ bool LogicAbsorber::match(Value a, Value b, DenseMap<Value, Value> &leafMap,
   matched[a] = b;
   auto *opA = a.getDefiningOp(), *opB = b.getDefiningOp();
   if (!opA || !opB || opA->getName() != opB->getName() ||
-      opA->getAttrDictionary() != opB->getAttrDictionary() ||
+      !sameAttributes(opA, opB) ||
       opA->getResultTypes() != opB->getResultTypes() ||
       opA->getNumOperands() != opB->getNumOperands() ||
       cast<OpResult>(a).getResultNumber() !=
@@ -467,8 +477,9 @@ void LogicAbsorber::run() {
       continue;
     // The model gains ports, so every instance of it must be one of these.
     unsigned numInstances = 0;
+    StringAttr modelName = name;
     top.walk([&](hw::InstanceOp instance) {
-      numInstances += instance.getModuleNameAttr().getAttr() == name;
+      numInstances += instance.getModuleNameAttr().getAttr() == modelName;
     });
     if (numInstances != instances.size())
       continue;
