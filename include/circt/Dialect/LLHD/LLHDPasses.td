@@ -32,6 +32,24 @@ def InlineCallsPass : Pass<"llhd-inline-calls", "ModuleOp"> {
   ];
 }
 
+def InferNoAliasPortsPass : Pass<"llhd-infer-noalias-ports",
+                                 "mlir::ModuleOp"> {
+  let summary = "Mark reference ports that no other port aliases";
+  let description = [{
+    A reference port of a module may be bound to the same signal as another of
+    its reference ports, so Mem2Reg and HoistSignals cannot promote or hoist
+    the drives of a process that accesses more than one port: the drives of
+    two such ports may have to stay ordered. When every instance of a private
+    module is known, the signal each port is bound to can be traced: to a
+    signal declared in the instantiating module, or to a port of that module,
+    which only aliases another of its ports if neither is marked. A port that
+    is bound, at every instance, to a signal no other reference port of the
+    instance is bound to is marked `llhd.noalias`, which lets these passes
+    treat it like a signal declared outside the process. Modules are
+    processed parents first; the marks of a previous run are recomputed.
+  }];
+}
+
 def LowerRefPortsPass : Pass<"llhd-lower-ref-ports", "mlir::ModuleOp"> {
   let summary = "Replace signal reference ports with value ports";
   let description = [{
@@ -48,8 +66,16 @@ def LowerRefPortsPass : Pass<"llhd-lower-ref-ports", "mlir::ModuleOp"> {
 
 def Sig2Reg : Pass<"llhd-sig2reg", "hw::HWModuleOp"> {
   let summary = "promote LLHD signals to SSA values";
+  let description = [{
+    A signal that a register drives, and that is also driven once with the
+    value it starts out with, as an `initial` block assigns it, holds the
+    register: the starting value becomes the register's preset, or, loaded
+    from a file by `$readmemh`/`$readmemb`, the file the register array is
+    loaded from, and the signal is promoted to the register's value.
+  }];
 
-  let dependentDialects = ["circt::hw::HWDialect", "circt::comb::CombDialect"];
+  let dependentDialects = ["circt::hw::HWDialect", "circt::comb::CombDialect",
+                           "circt::seq::SeqDialect"];
 }
 
 def Mem2RegPass : Pass<"llhd-mem2reg"> {
