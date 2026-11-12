@@ -16,6 +16,7 @@
 #include "circt/Dialect/Synth/Analysis/LongestPathAnalysis.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/AnalysisManager.h"
 #include "llvm/ADT/SmallVector.h"
@@ -272,6 +273,56 @@ TEST(LongestPathTest, Incremental) {
   ASSERT_EQ(*delayMul, 8);
   // After analysis, mul can no longer be safely mutated
   ASSERT_TRUE(!longestPath.isOperationValidToMutate(mul));
+}
+
+const char *eraseIR = R"MLIR(
+    hw.module private @erase(in %a: i1, in %b: i1, out x: i1) {
+      %0 = synth.aig.and_inv %a, %b : i1
+      %1 = synth.aig.and_inv %0, %b : i1
+      %2 = synth.aig.and_inv %1, %b : i1
+      %3 = synth.aig.and_inv %2, %a : i1
+      hw.output %0 : i1
+    }
+    )MLIR";
+
+// An operation erased through a rewriter that notifies the analysis leaves no
+// paths behind: an operation created afterwards, which the allocator may place
+// at the erased one's address, is timed afresh.
+TEST(LongestPathTest, IncrementalErase) {
+  MLIRContext context;
+  context.loadDialect<SynthDialect>();
+  context.loadDialect<hw::HWDialect>();
+  context.loadDialect<comb::CombDialect>();
+  circt::synth::registerSynthAnalysisPrerequisitePasses();
+
+  OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(eraseIR, &context);
+  ASSERT_TRUE(module);
+  SymbolTable symbolTable(module.get());
+  auto eraseModule = symbolTable.lookup<hw::HWModuleOp>("erase");
+  ASSERT_TRUE(eraseModule);
+  ModuleAnalysisManager mam(module.get(), nullptr);
+  AnalysisManager am(mam);
+  IncrementalLongestPathAnalysis longestPath(eraseModule, am);
+
+  auto *block = eraseModule.getBodyBlock();
+  auto a = block->getArgument(0), b = block->getArgument(1);
+  auto deep = cast<aig::AndInverterOp>(*std::next(block->begin(), 3));
+  auto delayDeep = longestPath.getMaxDelay(deep.getResult(), 0);
+  ASSERT_TRUE(succeeded(delayDeep));
+  ASSERT_EQ(*delayDeep, 4);
+
+  IRRewriter rewriter(&context);
+  rewriter.setListener(&longestPath);
+  const void *erasedAddress = deep.getOperation();
+  rewriter.eraseOp(deep);
+
+  rewriter.setInsertionPoint(block->getTerminator());
+  auto fresh = aig::AndInverterOp::create(rewriter, eraseModule.getLoc(), a, b,
+                                          false, false);
+  auto delayFresh = longestPath.getMaxDelay(fresh.getResult(), 0);
+  ASSERT_TRUE(succeeded(delayFresh));
+  EXPECT_EQ(*delayFresh, 1) << "fresh op at the erased op's address: "
+                            << (fresh.getOperation() == erasedAddress);
 }
 
 TEST(LongestPathTest, OpenPaths) {

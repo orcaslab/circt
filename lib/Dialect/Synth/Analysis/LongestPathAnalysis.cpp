@@ -596,6 +596,11 @@ public:
   // an empty array if not pre-computed.
   ArrayRef<OpenPath> getCachedPaths(Value value, size_t bitPos) const;
 
+  // Forget the paths of a value whose operation is erased. The cache is keyed
+  // by the value, and an operation created later can take the erased one's
+  // address: it must not find the erased value's paths.
+  void dropCachedPaths(Value value);
+
   // A map from the object to the maximum distance and history.
   using ObjectToMaxDistance =
       llvm::MapVector<Object,
@@ -807,6 +812,14 @@ ArrayRef<OpenPath> LocalVisitor::getCachedPaths(Value value,
   if (it == cachedResults.end())
     return {};
   return *it->second;
+}
+
+void LocalVisitor::dropCachedPaths(Value value) {
+  std::unique_lock<std::recursive_mutex> lock(cacheMutex, std::defer_lock);
+  if (done)
+    lock.lock();
+  for (size_t i = 0, e = getBitWidth(value); i < e; ++i)
+    cachedResults.erase({value, i});
 }
 
 void LocalVisitor::putUnclosedResult(const Object &object, int64_t delay,
@@ -2141,6 +2154,17 @@ void IncrementalLongestPathAnalysis::notifyOperationReplaced(
 
 void IncrementalLongestPathAnalysis::notifyOperationErased(Operation *op) {
   notifyOperationModified(op);
+  // Drop the erased results from the cache, valid or not: a value created
+  // later at the same address would otherwise read their paths, which made
+  // the timing-aware lowering depend on the allocator (run to run).
+  auto parentHWModule =
+      op->getParentRegion()->getParentOfType<hw::HWModuleOp>();
+  if (!parentHWModule)
+    return;
+  if (auto *localVisitor =
+          impl->ctx.getLocalVisitorMutable(parentHWModule.getModuleNameAttr()))
+    for (Value result : op->getResults())
+      localVisitor->dropCachedPaths(result);
 }
 
 // ===----------------------------------------------------------------------===//
