@@ -130,3 +130,26 @@ hw.module @Other(in %a: i2, in %b: i2, in %c: i2, out x: i2, out y: i2, out z: i
   hw.output %0, %1, %2, %3, %4, %5 : i2, i2, i2, i2, i2, i2
 }
 
+
+// A bit of a concat is taken from the operand holding it, the concat's last
+// operand holding bit 0 (found by a search over the operands' low bits).
+// CHECK-LABEL: hw.module @ConcatOperands
+hw.module @ConcatOperands(in %a: i3, in %b: i1, in %c: i2, in %x: i6, out f: i6) {
+  %cat = comb.concat %a, %b, %c : i3, i1, i2
+  %0 = synth.aig.and_inv not %cat, %x : i6
+  // CHECK-DAG: %[[C0:.+]] = comb.extract %c from 0 : (i2) -> i1
+  // CHECK-DAG: %[[C1:.+]] = comb.extract %c from 1 : (i2) -> i1
+  // CHECK-DAG: %[[A0:.+]] = comb.extract %a from 0 : (i3) -> i1
+  // CHECK-DAG: %[[A2:.+]] = comb.extract %a from 2 : (i3) -> i1
+  // CHECK-DAG: %[[X0:.+]] = comb.extract %x from 0 : (i6) -> i1
+  // CHECK-DAG: %[[X1:.+]] = comb.extract %x from 1 : (i6) -> i1
+  // CHECK-DAG: %[[X2:.+]] = comb.extract %x from 2 : (i6) -> i1
+  // CHECK-DAG: %[[X3:.+]] = comb.extract %x from 3 : (i6) -> i1
+  // CHECK-DAG: %[[X5:.+]] = comb.extract %x from 5 : (i6) -> i1
+  // CHECK-DAG: synth.aig.and_inv not %[[C0]], %[[X0]] : i1
+  // CHECK-DAG: synth.aig.and_inv not %[[C1]], %[[X1]] : i1
+  // CHECK-DAG: synth.aig.and_inv not %b, %[[X2]] : i1
+  // CHECK-DAG: synth.aig.and_inv not %[[A0]], %[[X3]] : i1
+  // CHECK-DAG: synth.aig.and_inv not %[[A2]], %[[X5]] : i1
+  hw.output %0 : i6
+}

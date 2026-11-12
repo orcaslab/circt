@@ -22,6 +22,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/KnownBits.h"
@@ -105,6 +106,10 @@ private:
   /// Uses operation-specific logic to determine which bits are constants.
   const llvm::KnownBits &computeKnownBits(Value value);
 
+  /// The low bit of each operand of a concat, from its last operand (bit 0)
+  /// to its first, computed once per concat.
+  ArrayRef<size_t> getConcatLowBits(comb::ConcatOp op);
+
   /// Get or create a boolean constant (0 or 1).
   /// Constants are cached by block to avoid duplication.
   Value getBoolConstant(bool value, Block *block);
@@ -131,6 +136,9 @@ private:
 
   /// Cache for computed known bits information
   llvm::MapVector<Value, llvm::KnownBits> knownBits;
+
+  /// Cache of each concat's operand low bits (getConcatLowBits)
+  llvm::DenseMap<Operation *, SmallVector<size_t>> concatLowBits;
 
   /// Cached boolean constants by block (false at index 0, true at index 1)
   llvm::DenseMap<Block *, std::array<Value, 2>> constantsByBlock;
@@ -193,14 +201,14 @@ Value BitBlaster::extractBit(Value value, size_t index) {
 
   return TypeSwitch<Operation *, Value>(op)
       .Case<comb::ConcatOp>([&](comb::ConcatOp op) {
-        for (auto operand : llvm::reverse(op.getOperands())) {
-          auto width = hw::getBitWidth(operand.getType());
-          assert(width >= 0 && "operand has zero width");
-          if (index < static_cast<size_t>(width))
-            return extractBit(operand, index);
-          index -= static_cast<size_t>(width);
-        }
-        llvm_unreachable("index out of bounds");
+        // Find the operand holding the bit by binary search over the
+        // operands' low bits: a scan per bit would be quadratic in the
+        // operands of a wide concat (an array of 2^16 one-bit registers).
+        // (The recursion may grow the cache: take the offset first.)
+        ArrayRef<size_t> lowBits = getConcatLowBits(op);
+        size_t i = llvm::upper_bound(lowBits, index) - lowBits.begin() - 1;
+        size_t offset = index - lowBits[i];
+        return extractBit(op.getOperand(op.getNumOperands() - 1 - i), offset);
       })
       .Case<comb::ExtractOp>([&](comb::ExtractOp ext) {
         return extractBit(ext.getInput(),
@@ -216,6 +224,20 @@ Value BitBlaster::extractBit(Value value, size_t index) {
         return getBoolConstant(value[index], op->getBlock());
       })
       .Default([&](auto op) { return lowerValueToBits(value)[index]; });
+}
+
+ArrayRef<size_t> BitBlaster::getConcatLowBits(comb::ConcatOp op) {
+  auto [it, inserted] = concatLowBits.try_emplace(op);
+  if (inserted) {
+    size_t lowBit = 0;
+    for (auto operand : llvm::reverse(op.getOperands())) {
+      auto width = hw::getBitWidth(operand.getType());
+      assert(width >= 0 && "operand has unknown width");
+      it->second.push_back(lowBit);
+      lowBit += static_cast<size_t>(width);
+    }
+  }
+  return it->second;
 }
 
 ArrayRef<Value> BitBlaster::lowerValueToBits(Value value) {
