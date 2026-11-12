@@ -555,9 +555,12 @@ private:
       cache;
 
   // Standard conversion pipeline: HW -> Comb -> AIG -> cleanup passes
-  // This pipeline is applied to wrapper modules to prepare them for analysis
+  // This pipeline is applied to each wrapper module, alone, as it is created:
+  // a run over the parent module would lower every earlier wrapper again (and
+  // verify them all), quadratic in the number of operations analyzed, and one
+  // wrapper that fails to lower would fail every later one.
   constexpr static StringRef pipelineStr =
-      "hw.module(hw-aggregate-to-comb,convert-comb-to-synth,cse,canonicalize)";
+      "hw-aggregate-to-comb,convert-comb-to-synth,cse,canonicalize";
   std::unique_ptr<mlir::PassManager> passManager;
 
   // Temporary module used to hold wrapper modules during analysis
@@ -1553,7 +1556,8 @@ OperationAnalyzer::getOrComputeLocalVisitor(Operation *op) {
   {
     mlir::ScopedDiagnosticHandler quiet(
         op->getContext(), [](Diagnostic &) { return success(); });
-    if (failed(passManager->run(moduleOp->getOperation()))) {
+    if (failed(passManager->run(hwModule))) {
+      hwModule.erase();
       cache.insert({key, nullptr});
       return failure();
     }
@@ -1602,7 +1606,8 @@ LogicalResult OperationAnalyzer::analyzeOperation(
 }
 
 LogicalResult OperationAnalyzer::initializePipeline() {
-  passManager = std::make_unique<mlir::PassManager>(loc->getContext());
+  passManager = std::make_unique<mlir::PassManager>(
+      loc->getContext(), hw::HWModuleOp::getOperationName());
   return parsePassPipeline(pipelineStr, *passManager);
 }
 
