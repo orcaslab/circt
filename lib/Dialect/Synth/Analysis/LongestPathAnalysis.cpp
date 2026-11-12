@@ -42,6 +42,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/Threading.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/Visitors.h"
@@ -1553,13 +1554,22 @@ OperationAnalyzer::getOrComputeLocalVisitor(Operation *op) {
 
   // The caller treats an operation it cannot analyze as a start point, so a
   // lowering that fails is no error of the design: keep its diagnostics out.
+  // The wrapper is lowered to its fixpoint before it is analyzed: one run of
+  // the pipeline can leave a constant operand's logic half simplified (an
+  // adder of a constant), and the analysis must time the circuit it keeps.
   {
     mlir::ScopedDiagnosticHandler quiet(
         op->getContext(), [](Diagnostic &) { return success(); });
-    if (failed(passManager->run(hwModule))) {
-      hwModule.erase();
-      cache.insert({key, nullptr});
-      return failure();
+    constexpr unsigned maxRuns = 8;
+    for (unsigned run = 0; run < maxRuns; ++run) {
+      mlir::OperationFingerPrint before(hwModule);
+      if (failed(passManager->run(hwModule))) {
+        hwModule.erase();
+        cache.insert({key, nullptr});
+        return failure();
+      }
+      if (mlir::OperationFingerPrint(hwModule) == before)
+        break;
     }
   }
 
