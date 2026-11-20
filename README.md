@@ -3,6 +3,49 @@
 [![](https://github.com/llvm/circt/actions/workflows/buildAndTest.yml/badge.svg?event=push)](https://github.com/llvm/circt/actions?query=workflow%3A%22Build+and+Test%22)
 [![Nightly integration tests](https://github.com/llvm/circt/workflows/Nightly%20integration%20tests/badge.svg)](https://github.com/llvm/circt/actions?query=workflow%3A%22Nightly+integration+tests%22)
 
+# orcaslab/circt: CIRCT for FoldSim and Beacon
+
+This is a fork of [llvm/circt](https://github.com/llvm/circt), kept on top of
+its `main` with full history. It carries the CIRCT changes that
+[FoldSim](https://github.com/orcaslab/foldsim) (hierarchical FAME-5 folding
+of RTL onto FPGAs) and [Beacon](https://github.com/orcaslab/beacon) (logic
+depth, area and timing screens of RTL before synthesis) need. They are general
+CIRCT fixes and features, kept here until they land upstream:
+
+- **Synth:** `LongestPathAnalysis` that scales to a full GPU (each wrapper
+  module lowered alone, no stale cached paths after an erase, distributed-RAM
+  reads and memory addresses timed), the generic LUT mapper with arrival times
+  at module boundaries and carry blocks, `LowerWordToBits` concat lookup by
+  binary search, `SOPBalancing` of constant functions.
+- **ImportVerilog / circt-verilog:** black-box modules (ports and parameters
+  only), memories detected for synthesis, hierarchical names, signedness of
+  propagated operands, `--max-unroll-trip-count`.
+- **LLHD:** `Sig2Reg`, `Mem2Reg`, `Deseq`, `HoistSignals`, `CombineDrives` and
+  `UnrollLoops` changes that lower the Vortex GPU's RTL to HW/Comb/Seq
+  (aggregate presets, part-of-signal drives, `keep` registers).
+- **HW / Seq:** `hw-expand-array-writes`, aggregates lowered to integers
+  (`HWAggregateToComb`), `seq-reg-const-prop`, `seq-retime-firmem-reads`,
+  `RegOfVecToMem` and `HWMemSimImpl` memory lowering for FPGA RAM inference.
+
+Every merge from upstream follows one rule: one design per overlap, chosen on
+evidence (tests, generality, measured QoR); the other is deleted, never kept as
+a fallback.
+
+**Build.** As upstream (below): build LLVM/MLIR at the `llvm` submodule's
+commit, then CIRCT with `-DCIRCT_SLANG_FRONTEND_ENABLED=ON` (circt-verilog).
+FoldSim and Beacon build against this CIRCT with
+`-DCIRCT_DIR=<build>/lib/cmake/circt -DMLIR_DIR=<llvm build>/lib/cmake/mlir`.
+
+**Related repositories:** [orcaslab/foldsim](https://github.com/orcaslab/foldsim),
+[orcaslab/beacon](https://github.com/orcaslab/beacon),
+[orcaslab/firesim](https://github.com/orcaslab/firesim),
+[orcaslab/slash](https://github.com/orcaslab/slash), and the
+[Vortex GPGPU](https://github.com/vortexgpgpu/vortex) that uses them.
+
+The rest of this file is upstream CIRCT's README.
+
+---
+
 # ⚡️ "CIRCT" / Circuit IR Compilers and Tools
 
 "CIRCT" stands for "Circuit Intermediate Representations (IR) Compilers and Tools".  One might also interpret
