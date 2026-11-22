@@ -141,7 +141,7 @@ func.func private @recSelf() {
 // function call; its `llhd.return` continues after the call with its values.
 // CHECK-LABEL: @NonSuspendingCoroutine
 hw.module @NonSuspendingCoroutine(in %a: i42, in %b: i42) {
-  %t = llhd.constant_time <0ns, 1d, 0e>
+  %t = llhd.constant_time <0ns, 1d>
   %sig = llhd.sig %a : <i42>
   // CHECK: llhd.process
   llhd.process {
