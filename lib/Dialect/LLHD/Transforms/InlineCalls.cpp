@@ -9,6 +9,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LLHD/LLHDOps.h"
 #include "circt/Dialect/LLHD/LLHDPasses.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/SymbolTable.h"
@@ -35,16 +36,49 @@ using namespace llhd;
 using llvm::SmallSetVector;
 
 namespace {
+/// Whether a coroutine never suspends: its body has no `llhd.wait` and every
+/// coroutine it calls never suspends either. Such a coroutine is a
+/// SystemVerilog task without timing controls; it runs to completion within
+/// the caller's time step, exactly like a function, so its calls are inlined
+/// like function calls. A coroutine that calls itself (directly or through
+/// others) is not taken. `memo` caches the answer per coroutine; a coroutine
+/// on the current path counts as suspending.
+static bool neverSuspends(CoroutineOp coroutine, const SymbolTable &symbolTable,
+                          DenseMap<Operation *, bool> &memo) {
+  auto [it, inserted] = memo.try_emplace(coroutine, false);
+  if (!inserted)
+    return it->second;
+  bool result = true;
+  coroutine.walk([&](Operation *op) {
+    if (isa<WaitOp>(op)) {
+      result = false;
+      return WalkResult::interrupt();
+    }
+    if (auto call = dyn_cast<CallCoroutineOp>(op)) {
+      auto callee = dyn_cast_or_null<CoroutineOp>(
+          symbolTable.lookup(call.getCalleeAttr().getAttr()));
+      if (!callee || !neverSuspends(callee, symbolTable, memo)) {
+        result = false;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  memo[coroutine] = result;
+  return result;
+}
+
 /// Implementation of the `InlinerInterface` that allows calls in SSACFG regions
 /// nested within `llhd.process`, `llhd.final`, and `llhd.combinational` ops to
-/// be inlined.
+/// be inlined. Coroutines are inlined only where the pass found that they never
+/// suspend (`neverSuspends`).
 struct FunctionInliner : public InlinerInterface {
   using InlinerInterface::InlinerInterface;
 
   bool isLegalToInline(Operation *call, Operation *callable,
                        bool wouldBeCloned) const override {
-    // Only inline `func.func` ops.
-    if (!isa<func::FuncOp>(callable))
+    // Only inline `func.func` and (non-suspending) `llhd.coroutine` ops.
+    if (!isa<func::FuncOp, CoroutineOp>(callable))
       return false;
 
     // Only inline into SSACFG regions embedded within LLHD processes.
@@ -72,14 +106,35 @@ struct FunctionInliner : public InlinerInterface {
   void handleTerminator(Operation *op, Block *newDest) const override {
     if (isa<mlir::ub::UnreachableOp>(op))
       return;
+    // A coroutine's `llhd.return` continues after the call, like a function's
+    // return: a branch to the continuation block with the returned values.
+    if (auto ret = dyn_cast<ReturnOp>(op)) {
+      OpBuilder builder(op);
+      cf::BranchOp::create(builder, op->getLoc(), newDest, ret.getOperands());
+      op->erase();
+      return;
+    }
     InlinerInterface::handleTerminator(op, newDest);
+  }
+
+  void handleTerminator(Operation *op,
+                        ValueRange valuesToReplace) const override {
+    if (auto ret = dyn_cast<ReturnOp>(op)) {
+      for (auto [from, to] : llvm::zip(valuesToReplace, ret.getOperands()))
+        from.replaceAllUsesWith(to);
+      return;
+    }
+    InlinerInterface::handleTerminator(op, valuesToReplace);
   }
 };
 
 /// Pass implementation.
 struct InlineCallsPass
     : public llhd::impl::InlineCallsPassBase<InlineCallsPass> {
-  using CallStack = SmallSetVector<func::FuncOp, 8>;
+  using CallStack = SmallSetVector<Operation *, 8>;
+  /// Per coroutine, whether it never suspends (`neverSuspends`), filled
+  /// before the modules are walked in parallel.
+  DenseMap<Operation *, bool> nonSuspending;
   void runOnOperation() override;
   LogicalResult runOnRegion(Region &region, const SymbolTable &symbolTable,
                             CallStack &callStack);
@@ -88,6 +143,9 @@ struct InlineCallsPass
 
 void InlineCallsPass::runOnOperation() {
   auto &symbolTable = getAnalysis<SymbolTable>();
+  nonSuspending.clear();
+  for (auto coroutine : getOperation().getOps<CoroutineOp>())
+    neverSuspends(coroutine, symbolTable, nonSuspending);
   if (failed(failableParallelForEach(
           &getContext(), getOperation().getOps<hw::HWModuleOp>(),
           [&](auto module) {
@@ -103,7 +161,7 @@ LogicalResult InlineCallsPass::runOnRegion(Region &region,
   FunctionInliner inliner(&getContext());
   InlinerConfig config;
   SmallVector<Operation *> callsToErase;
-  SmallVector<std::pair<Operation *, func::FuncOp>> inlineEndMarkers;
+  SmallVector<std::pair<Operation *, Operation *>> inlineEndMarkers;
 
   // Walk all calls in the HW module and inline each. Emit a diagnostic if a
   // call does not target a `func.func` op or the inliner fails for some reason.
@@ -117,7 +175,8 @@ LogicalResult InlineCallsPass::runOnRegion(Region &region,
         assert(inlineEndMarkers.back().second == callStack.back());
         LLVM_DEBUG(llvm::dbgs()
                    << "- Finished @"
-                   << inlineEndMarkers.back().second.getSymName() << "\n");
+                   << SymbolTable::getSymbolName(inlineEndMarkers.back().second)
+                   << "\n");
         inlineEndMarkers.pop_back();
         callStack.pop_back();
       }
@@ -126,6 +185,29 @@ LogicalResult InlineCallsPass::runOnRegion(Region &region,
       for (auto &nestedRegion : op.getRegions())
         if (failed(runOnRegion(nestedRegion, symbolTable, callStack)))
           return failure();
+
+      // A call of a coroutine that never suspends is inlined like a function
+      // call; one that may suspend stays a call.
+      if (auto coCall = dyn_cast<CallCoroutineOp>(op)) {
+        auto coroutine = dyn_cast_or_null<CoroutineOp>(
+            symbolTable.lookup(coCall.getCalleeAttr().getAttr()));
+        auto known = coroutine ? nonSuspending.find(coroutine)
+                               : nonSuspending.end();
+        if (known == nonSuspending.end() || !known->second)
+          continue;
+        if (!callStack.insert(coroutine))
+          continue;
+        inlineEndMarkers.push_back({op.getNextNode(), coroutine});
+        LLVM_DEBUG(llvm::dbgs() << "- Inlining " << coCall << "\n");
+        if (failed(inlineCall(inliner, config.getCloneCallback(),
+                              cast<CallOpInterface>(op),
+                              cast<CallableOpInterface>(coroutine.getOperation()),
+                              &coroutine.getBody())))
+          return coCall.emitError("coroutine call cannot be inlined");
+        callsToErase.push_back(coCall);
+        ++numInlined;
+        continue;
+      }
 
       // We only care about calls.
       auto callOp = dyn_cast<func::CallOp>(op);

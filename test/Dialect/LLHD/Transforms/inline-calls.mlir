@@ -135,3 +135,79 @@ func.func private @recSelf() {
   call @recSelf() : () -> ()
   return
 }
+
+// A call of a coroutine that never suspends (a task without timing controls,
+// such as an empty task an `assert` macro expands to) is inlined like a
+// function call; its `llhd.return` continues after the call with its values.
+// CHECK-LABEL: @NonSuspendingCoroutine
+hw.module @NonSuspendingCoroutine(in %a: i42, in %b: i42) {
+  %t = llhd.constant_time <0ns, 1d, 0e>
+  %sig = llhd.sig %a : <i42>
+  // CHECK: llhd.process
+  llhd.process {
+    // CHECK-NOT: llhd.call_coroutine @emptyTask
+    llhd.call_coroutine @emptyTask() : () -> ()
+    // CHECK-NOT: llhd.call_coroutine @addTask
+    // CHECK: [[SUM:%.+]] = comb.add %a, %b
+    %0 = llhd.call_coroutine @addTask(%a, %b) : (i42, i42) -> i42
+    // CHECK-NOT: llhd.call_coroutine @outerTask
+    // CHECK: comb.xor
+    %1 = llhd.call_coroutine @outerTask(%0) : (i42) -> i42
+    // A coroutine with control flow: its returns branch to the continuation.
+    // CHECK-NOT: llhd.call_coroutine @branchTask
+    // CHECK: cf.cond_br
+    // CHECK: cf.br [[CONT:\^.+]]([[X:%.+]] : i42)
+    // CHECK: cf.br [[CONT]]
+    // CHECK: [[CONT]]([[R:%.+]]: i42):
+    %2 = llhd.call_coroutine @branchTask(%1) : (i42) -> i42
+    // A coroutine that waits, or calls one that does, stays a call.
+    // CHECK: llhd.call_coroutine @waitTask()
+    llhd.call_coroutine @waitTask() : () -> ()
+    // CHECK: llhd.call_coroutine @callsWaitTask()
+    llhd.call_coroutine @callsWaitTask() : () -> ()
+    llhd.drv %sig, %2 after %t : i42
+    llhd.halt
+  }
+}
+
+// CHECK-DCE-NOT: @emptyTask
+llhd.coroutine private @emptyTask() {
+  llhd.return
+}
+
+// CHECK-DCE-NOT: @addTask
+llhd.coroutine private @addTask(%x: i42, %y: i42) -> i42 {
+  %0 = comb.add %x, %y : i42
+  llhd.return %0 : i42
+}
+
+llhd.coroutine private @outerTask(%x: i42) -> i42 {
+  %c = hw.constant 7 : i42
+  %0 = comb.xor %x, %c : i42
+  llhd.call_coroutine @emptyTask() : () -> ()
+  llhd.return %0 : i42
+}
+
+// CHECK-DCE-NOT: @branchTask
+llhd.coroutine private @branchTask(%x: i42) -> i42 {
+  %c0 = hw.constant 0 : i42
+  %c = comb.icmp eq %x, %c0 : i42
+  cf.cond_br %c, ^bb1, ^bb2
+^bb1:
+  llhd.return %x : i42
+^bb2:
+  %y = comb.sub %c0, %x : i42
+  llhd.return %y : i42
+}
+
+// CHECK-DCE: llhd.coroutine private @waitTask
+llhd.coroutine private @waitTask() {
+  llhd.wait ^bb1
+^bb1:
+  llhd.return
+}
+
+llhd.coroutine private @callsWaitTask() {
+  llhd.call_coroutine @waitTask() : () -> ()
+  llhd.return
+}
