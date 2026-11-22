@@ -22,7 +22,11 @@ CIRCT fixes and features, kept here until they land upstream:
   propagated operands, `--max-unroll-trip-count`.
 - **LLHD:** `Sig2Reg`, `Mem2Reg`, `Deseq`, `HoistSignals`, `CombineDrives` and
   `UnrollLoops` changes that lower the Vortex GPU's RTL to HW/Comb/Seq
-  (aggregate presets, part-of-signal drives, `keep` registers).
+  (aggregate presets, part-of-signal drives, `keep` registers), and
+  `InlineCalls` inlining calls of coroutines that never suspend (a task with no
+  timing control, such as PicoRV32's empty `assert` task).
+- **ExportVerilog:** `PrepareForEmission` keeps declaration initializers of
+  spilled constants.
 - **HW / Seq:** `hw-expand-array-writes`, aggregates lowered to integers
   (`HWAggregateToComb`), `seq-reg-const-prop`, `seq-retime-firmem-reads`,
   `RegOfVecToMem` and `HWMemSimImpl` memory lowering for FPGA RAM inference.
@@ -31,10 +35,94 @@ Every merge from upstream follows one rule: one design per overlap, chosen on
 evidence (tests, generality, measured QoR); the other is deleted, never kept as
 a fallback.
 
-**Build.** As upstream (below): build LLVM/MLIR at the `llvm` submodule's
-commit, then CIRCT with `-DCIRCT_SLANG_FRONTEND_ENABLED=ON` (circt-verilog).
-FoldSim and Beacon build against this CIRCT with
-`-DCIRCT_DIR=<build>/lib/cmake/circt -DMLIR_DIR=<llvm build>/lib/cmake/mlir`.
+## Quick start: build and run a demo
+
+Tested on Ubuntu 24.04 (x86-64), clang 18, CMake 3.31, Ninja 1.11. Plan for
+about 60 GB of disk, 2 GB of RAM per build job, and roughly an hour on 16
+cores for LLVM/MLIR and CIRCT together.
+
+**1. Prerequisites.**
+
+```sh
+sudo apt-get install -y git cmake ninja-build clang lld python3 ccache
+```
+
+CMake 3.20 or newer, and clang 16+ or GCC 11+. `lld` is optional: if it is
+not installed, set `LINKER=gold` (or leave `LLVM_USE_LINKER` out) in step 3.
+
+**2. Clone CIRCT and its LLVM.** The `llvm` submodule pins the LLVM commit this
+CIRCT builds with.
+
+```sh
+mkdir -p ~/orcaslab && cd ~/orcaslab
+git clone https://github.com/orcaslab/circt.git
+cd circt
+git submodule update --init --depth 1 llvm
+```
+
+**3. Build LLVM and MLIR** into `llvm/build`. `J` is the number of build jobs.
+
+```sh
+J=$(nproc); LINKER=lld
+cmake -G Ninja -S llvm/llvm -B llvm/build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_USE_LINKER=$LINKER \
+  -DLLVM_ENABLE_PROJECTS=mlir -DLLVM_TARGETS_TO_BUILD=host \
+  -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_INSTALL_UTILS=ON -DLLVM_CCACHE_BUILD=ON
+ninja -C llvm/build -j$J
+```
+
+**4. Build CIRCT** into `build`, with the SystemVerilog front end
+(`circt-verilog`, slang is fetched at configure time), and run its tests.
+
+```sh
+cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_USE_LINKER=$LINKER \
+  -DMLIR_DIR=$PWD/llvm/build/lib/cmake/mlir -DLLVM_DIR=$PWD/llvm/build/lib/cmake/llvm \
+  -DLLVM_EXTERNAL_LIT=$PWD/llvm/build/bin/llvm-lit \
+  -DCIRCT_SLANG_FRONTEND_ENABLED=ON -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_CCACHE_BUILD=ON
+ninja -C build -j$J
+ninja -C build check-circt          # lit tests
+export PATH=$PWD/build/bin:$PATH    # circt-verilog, circt-opt, circt-synth, firtool
+```
+
+**5. Run the demo.** [`examples/orcaslab`](examples/orcaslab) holds `mac.sv`, a
+multiply-accumulate whose product and add share one cycle (`PIPE=0`), or take
+one cycle each (`PIPE=1`). `demo.sh` runs the flow FoldSim and Beacon build on:
+
+1. import SystemVerilog to the HW/Comb/Seq dialects (`circt-verilog`);
+2. map to 6-input LUTs (`circt-synth --lower-to-k-lut=6`);
+3. report the longest register-to-register paths
+   (`synth-print-longest-path-analysis`);
+4. write Verilog back out (`firtool`).
+
+```sh
+examples/orcaslab/demo.sh            # writes examples/orcaslab/out/
+```
+
+Expected output:
+
+```
+PIPE=0: Maximum path delay: 11, Verilog in out/mac0_out.sv
+PIPE=1: Maximum path delay: 8, Verilog in out/mac1_out.sv
+```
+
+`examples/orcaslab/out/mac0_paths.txt` lists the deepest end points, `acc` from
+`a_q` and `b_q` through the multiplier and the adder. The same steps by hand:
+
+```sh
+cd examples/orcaslab
+circt-verilog --ir-hw --top=mac -G PIPE=0 mac.sv -o mac.mlir
+circt-synth mac.mlir --top mac --lower-to-k-lut=6 -o mac_lut.mlir
+circt-opt mac_lut.mlir -o /dev/null \
+  --pass-pipeline='builtin.module(synth-print-longest-path-analysis{top-module-name=mac})'
+firtool mac.mlir --format=mlir -o mac_out.sv
+```
+
+**Next.** [Beacon](https://github.com/orcaslab/beacon) counts the same paths
+as Vivado does (carry chains, DSPs, distributed RAM), and
+[FoldSim](https://github.com/orcaslab/foldsim) folds a design into an FPGA
+simulator. Both build against this CIRCT with
+`-DCIRCT_DIR=$PWD/build/lib/cmake/circt -DMLIR_DIR=$PWD/llvm/build/lib/cmake/mlir -DLLVM_DIR=$PWD/llvm/build/lib/cmake/llvm`.
 
 **Related repositories:** [orcaslab/foldsim](https://github.com/orcaslab/foldsim),
 [orcaslab/beacon](https://github.com/orcaslab/beacon),
