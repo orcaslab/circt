@@ -37,9 +37,10 @@ a fallback.
 
 ## Quick start: build and run a demo
 
-Tested on Ubuntu 24.04 (x86-64), clang 18, CMake 3.31, Ninja 1.11. Plan for
-about 60 GB of disk, 2 GB of RAM per build job, and roughly an hour on 16
-cores for LLVM/MLIR and CIRCT together.
+Tested on Ubuntu 24.04 (x86-64), clang 18, CMake 3.31, Ninja 1.11. The
+checkout and both builds take about 10 GB of disk (5 GB for LLVM/MLIR, 2 GB
+for CIRCT). Most of the build time goes to LLVM/MLIR; with `ccache`, rebuilds
+take minutes.
 
 **1. Prerequisites.**
 
