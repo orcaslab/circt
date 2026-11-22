@@ -79,7 +79,8 @@ cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_USE_LINKER=$LINKER \
   -DMLIR_DIR=$PWD/llvm/build/lib/cmake/mlir -DLLVM_DIR=$PWD/llvm/build/lib/cmake/llvm \
   -DLLVM_EXTERNAL_LIT=$PWD/llvm/build/bin/llvm-lit \
-  -DCIRCT_SLANG_FRONTEND_ENABLED=ON -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_CCACHE_BUILD=ON
+  -DCIRCT_SLANG_FRONTEND_ENABLED=ON -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_CCACHE_BUILD=ON \
+  -DCMAKE_CXX_SCAN_FOR_MODULES=OFF   # slang's C++20 module scan needs clang-scan-deps
 ninja -C build -j$J
 ninja -C build check-circt          # lit tests
 export PATH=$PWD/build/bin:$PATH    # circt-verilog, circt-opt, circt-synth, firtool
