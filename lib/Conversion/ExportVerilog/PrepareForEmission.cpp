@@ -256,9 +256,22 @@ static void lowerUsersToTemporaryWire(Operation &op,
     else
       newWire = sv::WireOp::create(builder, wireElementType, name);
 
+    // A declaration's initializer stays on a constant: Verilog evaluates a
+    // variable's initializer once, before any continuous assignment, and only
+    // a declaration whose operands are constant can be hoisted above a use
+    // that precedes it. Spilling a constant for one user (e.g. a name in event
+    // control) must not turn the initializers that share it into wire reads.
+    bool keepInitializers = isConstantExpression(&op);
+
     // Replace all uses with newWire. Wrap in ReadInOutOp if required.
-    while (!result.use_empty()) {
-      OpOperand &use = *result.getUses().begin();
+    for (OpOperand &use : llvm::make_early_inc_range(result.getUses())) {
+      if (keepInitializers && isa<RegOp, LogicOp, VarOp>(use.getOwner()))
+        continue;
+      // A wire aliases a declaration's value, not its storage: only reads move
+      // to it. Assignments (procedural ones cannot target a net) and other
+      // handle users keep the declaration itself.
+      if (isResultInOut && !isa<ReadInOutOp>(use.getOwner()))
+        continue;
       if (isResultInOut) {
         use.set(newWire);
       } else {

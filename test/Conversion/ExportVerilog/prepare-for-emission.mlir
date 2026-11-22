@@ -368,3 +368,54 @@ hw.module @VariadicSingleOperand(in %a : i1, out b: i1) {
 // CHECK:           hw.output %[[A]] : i1
   hw.output %0 : i1
 }
+
+// -----
+
+// A constant spilled to a wire for one user that needs a name (here the reset
+// in an always_ff's event control) keeps the declaration it initializes: the
+// initializer stays constant, so the register is still hoisted above its
+// earlier read instead of being aliased by a wire.
+// CHECK-LABEL: hw.module @SpillConstantKeepsInitializer
+hw.module @SpillConstantKeepsInitializer(in %clk : i1, in %a : i1, out o : i1) {
+  // CHECK: %r = sv.reg init %false : !hw.inout<i1>
+  // CHECK-NOT: sv.passign %{{.*}}wire
+  // CHECK: sv.alwaysff(posedge %clk) {
+  // CHECK-NEXT: sv.passign %r, %a : i1
+  %false = hw.constant false
+  %0 = sv.read_inout %r : !hw.inout<i1>
+  %1 = comb.xor %0, %a : i1
+  %r = sv.reg init %false : !hw.inout<i1>
+  sv.alwaysff(posedge %clk) {
+    sv.passign %r, %a : i1
+  } (syncreset : posedge %false) {
+    sv.passign %r, %false : i1
+  }
+  hw.output %1 : i1
+}
+
+// -----
+
+// A register that cannot be hoisted (its initializer is not constant) and is
+// read before its declaration: the temporary wire takes the reads, while the
+// procedural assignment keeps the register (a net cannot be assigned there).
+// CHECK-LABEL: hw.module @TemporaryWireKeepsWrites
+hw.module @TemporaryWireKeepsWrites(in %clk : i1, in %x : i1) {
+  // CHECK: %[[WIRE:.*]] = sv.wire : !hw.inout<i1>
+  // CHECK-NEXT: %[[VAL_0:.*]] = sv.read_inout %[[WIRE]]  : !hw.inout<i1>
+  // CHECK-NEXT: %b = sv.reg init %[[VAL_0]] : !hw.inout<i1>
+  // CHECK-NEXT: %[[VAL_1:.*]] = sv.read_inout %b : !hw.inout<i1>
+  // CHECK-NEXT: %a = sv.reg init %[[VAL_1]] : !hw.inout<i1>
+  // CHECK-NEXT: %[[VAL_2:.*]] = sv.read_inout %a : !hw.inout<i1>
+  // CHECK-NEXT: sv.assign %[[WIRE]], %[[VAL_2]] : i1
+  // CHECK-NEXT: sv.always posedge %clk {
+  // CHECK-NEXT: sv.passign %a, %x : i1
+  // CHECK-NEXT: sv.passign %b, %x : i1
+  %0 = sv.read_inout %a : !hw.inout<i1>
+  %1 = sv.read_inout %b : !hw.inout<i1>
+  %b = sv.reg init %0 : !hw.inout<i1>
+  %a = sv.reg init %1 : !hw.inout<i1>
+  sv.always posedge %clk {
+    sv.passign %a, %x : i1
+    sv.passign %b, %x : i1
+  }
+}
