@@ -432,8 +432,10 @@ class Cut {
   mutable std::optional<BinaryTruthTable> truthTable;
 
   /// Cached NPN canonical form for this cut.
-  /// Computed lazily from the truth table when first accessed.
-  mutable std::optional<NPNClass> npnClass;
+  /// Computed lazily from the truth table when first accessed. Held out of
+  /// line: only truth-table matchers compute it, and every cut pays for the
+  /// field.
+  mutable std::unique_ptr<NPNClass> npnClass;
 
   std::optional<MatchedPattern> matchedPattern;
 
@@ -448,8 +450,9 @@ class Cut {
 
   /// Operand cuts used to create this cut (for lazy TT computation).
   /// Stored to enable fast incremental truth table computation after
-  /// duplicate removal. Using raw pointers is safe since cuts are allocated
-  /// via bump allocator and live for the duration of enumeration.
+  /// duplicate removal. They are only read until the cut's own cut set is
+  /// finalized, which clears them: an operand's cuts may be recycled once all
+  /// of its fanouts are finalized.
   llvm::SmallVector<const Cut *, 3> operandCuts;
 
 public:
@@ -565,13 +568,23 @@ public:
 /// results.
 class CutSet {
 private:
-  llvm::SmallVector<Cut *, 12> cuts; ///< Collection of cuts for this node
+  /// Collection of cuts for this node. No inline storage: a node's candidates
+  /// outgrow any small buffer, and a released set keeps only its best cut.
+  llvm::SmallVector<Cut *, 0> cuts;
   Cut *bestCut = nullptr;
-  bool isFrozen = false; ///< Whether cut set is finalized
+  bool isFrozen = false;   ///< Whether cut set is finalized
+  bool isReleased = false; ///< Whether only the best cut is left
 
 public:
   /// Check if this cut set has a valid matched pattern.
   bool isMatched() const { return bestCut; }
+
+  /// Whether finalize() has run.
+  bool isFinalized() const { return isFrozen; }
+
+  /// Drop every cut but the best matched one, once no fanout will read this
+  /// set's cuts again. `recycle` takes each dropped cut.
+  void releaseNonBestCuts(llvm::function_ref<void(Cut *)> recycle);
 
   /// Get the cut associated with the best matched pattern.
   Cut *getBestMatchedCut() const;
@@ -648,13 +661,29 @@ public:
   template <typename... Args>
   T *create(Args &&...args) {
     ++allocationCount;
-    return new (allocator.Allocate()) T(std::forward<Args>(args)...);
+    if (freeList.empty())
+      return new (allocator.Allocate()) T(std::forward<Args>(args)...);
+    T *object = freeList.pop_back_val();
+    object->~T();
+    return new (object) T(std::forward<Args>(args)...);
   }
 
-  void DestroyAll() { allocator.DestroyAll(); }
+  /// Take back an object nothing refers to any more; the next create() reuses
+  /// its slot. Until then it is a valid empty object, so DestroyAll destroys
+  /// every slot exactly once.
+  void recycle(T *object) {
+    *object = T();
+    freeList.push_back(object);
+  }
+
+  void DestroyAll() {
+    allocator.DestroyAll();
+    freeList.clear();
+  }
 
 private:
   llvm::SpecificBumpPtrAllocator<T> allocator;
+  llvm::SmallVector<T *, 0> freeList;
   uint64_t &allocationCount;
 };
 /// Cut enumeration engine for combinational logic networks.
@@ -728,6 +757,18 @@ private:
   /// visited yet: a value the network does not map may depend on gates that
   /// come later in the block than the gates that read it.
   LogicalResult visitLogicCone(uint32_t index);
+
+  /// Call `fn` with the index of each fanin whose cut set visitLogicOp reads
+  /// for the logic gate at `index`, once per read.
+  void forEachFanin(uint32_t index, llvm::function_ref<void(uint32_t)> fn);
+
+  /// After the cut set of `index` is finalized: recycle the candidates it
+  /// dropped (`candidates` is every cut added to it), and every cut but the
+  /// best one of each cut set whose fanouts have all been finalized now.
+  void releaseCuts(uint32_t index, ArrayRef<Cut *> candidates);
+
+  /// Per network index, the fanout reads of its cut set not done yet.
+  llvm::SmallVector<uint32_t, 0> pendingFanoutReads;
 
   /// The arrival times getArrivalTime computed, by value and bit.
   llvm::DenseMap<std::pair<Value, unsigned>, std::optional<DelayType>>

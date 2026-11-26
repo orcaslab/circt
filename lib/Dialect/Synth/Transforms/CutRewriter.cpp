@@ -398,7 +398,7 @@ const NPNClass &Cut::getNPNClass(const NPNTable *npnTable) const {
   if (!npnTable || !npnTable->lookup(truthTable, canonicalForm))
     canonicalForm = NPNClass::computeNPNCanonicalForm(truthTable);
 
-  npnClass.emplace(std::move(canonicalForm));
+  npnClass = std::make_unique<NPNClass>(std::move(canonicalForm));
   return *npnClass;
 }
 
@@ -725,14 +725,28 @@ double MatchedPattern::getArea() const {
 
 Cut *CutSet::getBestMatchedCut() const { return bestCut; }
 
-unsigned CutSet::size() const { return cuts.size(); }
+unsigned CutSet::size() const { return getCuts().size(); }
 
 void CutSet::addCut(Cut *cut) {
   assert(!isFrozen && "Cannot add cuts to a frozen cut set");
   cuts.push_back(cut);
 }
 
-ArrayRef<Cut *> CutSet::getCuts() const { return cuts; }
+ArrayRef<Cut *> CutSet::getCuts() const {
+  if (isReleased)
+    return ArrayRef<Cut *>(&bestCut, bestCut ? 1 : 0);
+  return cuts;
+}
+
+void CutSet::releaseNonBestCuts(llvm::function_ref<void(Cut *)> recycle) {
+  assert(isFrozen && "only a finalized cut set can be released");
+  for (Cut *cut : cuts)
+    if (cut != bestCut)
+      recycle(cut);
+  // Free the buffer too: the set lives until the module is rewritten.
+  decltype(cuts)().swap(cuts);
+  isReleased = true;
+}
 
 // Remove duplicate cuts and non-minimal cuts. A cut is non-minimal if there
 // exists another cut that is a subset of it.
@@ -935,6 +949,7 @@ CutSet *CutEnumerator::createNewCutSet(uint32_t index) {
 
 void CutEnumerator::clear() {
   cutSets.clear();
+  pendingFanoutReads.clear();
   arrivalTimes.clear();
   processingOrder.clear();
   logicNetwork.clear();
@@ -973,7 +988,9 @@ LogicalResult CutEnumerator::visitLogicOp(uint32_t nodeIndex) {
     }
 
     // Finalize cut set: remove duplicates, limit size, and match patterns
+    SmallVector<Cut *, 16> candidates(resultCutSet->getCuts());
     resultCutSet->finalize(options, matchCut, logicNetwork);
+    releaseCuts(nodeIndex, candidates);
     return success();
   }
 
@@ -1154,9 +1171,54 @@ LogicalResult CutEnumerator::visitLogicOp(uint32_t nodeIndex) {
   enumerateCutCombinations(enumerateCutCombinations, 0, cutPtrs, 0ULL);
 
   // Finalize cut set: remove duplicates, limit size, and match patterns
+  SmallVector<Cut *, 64> candidates(resultCutSet->getCuts());
   resultCutSet->finalize(options, matchCut, logicNetwork);
+  releaseCuts(nodeIndex, candidates);
 
   return success();
+}
+
+void CutEnumerator::forEachFanin(uint32_t index,
+                                 llvm::function_ref<void(uint32_t)> fn) {
+  const auto &gate = logicNetwork.getGate(index);
+  if (gate.getKind() == LogicNetworkGate::Choice) {
+    for (Value operand : cast<synth::ChoiceOp>(gate.getOperation()).getInputs())
+      fn(logicNetwork.getIndex(operand));
+    return;
+  }
+  for (unsigned i = 0, e = gate.getNumFanins(); i < e; ++i)
+    fn(gate.edges[i].getIndex());
+}
+
+void CutEnumerator::releaseCuts(uint32_t index, ArrayRef<Cut *> candidates) {
+  CutSet *cutSet = cutSets.lookup(index);
+  ArrayRef<Cut *> kept = cutSet->getCuts();
+  // Every kept cut has its truth table now; nothing reads its operand cuts.
+  for (Cut *cut : kept)
+    cut->setOperandCuts({});
+  auto recycle = [&](Cut *cut) { cutAllocator.recycle(cut); };
+  for (Cut *cut : candidates)
+    if (!llvm::is_contained(kept, cut))
+      recycle(cut);
+
+  // The priority cuts test dumps every cut set after the enumeration.
+  if (options.testPriorityCuts)
+    return;
+
+  // Only the fanouts of a gate merge its cuts; its best cut stays for the
+  // arrival times of the cuts that take it as an input, and for the rewrite.
+  if (pendingFanoutReads[index] == 0)
+    cutSet->releaseNonBestCuts(recycle);
+  forEachFanin(index, [&](uint32_t fanin) {
+    assert(pendingFanoutReads[fanin] > 0 && "fanout read not counted");
+    if (--pendingFanoutReads[fanin] != 0)
+      return;
+    // A fanin read before it was visited (a loop through values the network
+    // does not map) is released once it is finalized, above.
+    CutSet *faninCutSet = cutSets.lookup(fanin);
+    if (faninCutSet && faninCutSet->isFinalized())
+      faninCutSet->releaseNonBestCuts(recycle);
+  });
 }
 
 LogicalResult CutEnumerator::enumerateCuts(
@@ -1176,6 +1238,13 @@ LogicalResult CutEnumerator::enumerateCuts(
   auto &block = topOp->getRegion(0).getBlocks().front();
   if (failed(logicNetwork.buildFromBlock(&block)))
     return failure();
+
+  // Count the reads of each cut set by the fanouts that merge its cuts, so
+  // that a node's cuts other than its best can be dropped after the last one.
+  pendingFanoutReads.assign(logicNetwork.size(), 0);
+  for (const auto &[index, gate] : llvm::enumerate(logicNetwork.getGates()))
+    if (gate.isLogicGate())
+      forEachFanin(index, [&](uint32_t fanin) { ++pendingFanoutReads[fanin]; });
 
   for (const auto &[index, gate] : llvm::enumerate(logicNetwork.getGates())) {
     // Skip non-logic gates.
